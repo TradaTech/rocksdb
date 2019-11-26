@@ -110,6 +110,17 @@ static bool IsObject (napi_env env, napi_value value) {
 }
 
 /**
+ * Returns true if 'value' is nil.
+ */
+static bool IsNotFunction(napi_env env, napi_value value)
+{
+  napi_valuetype type;
+  napi_typeof(env, value, &type);
+  return type != napi_function;
+}
+
+
+/**
  * Create an error object.
  */
 static napi_value CreateError (napi_env env, const char* str) {
@@ -283,6 +294,15 @@ struct BaseWorker {
               napi_value callback,
               const char* resourceName)
     : env_(env), database_(database), errMsg_(NULL) {
+    // sync method
+    if (IsNotFunction(env_, callback))
+    {
+      std::string errorMsg = "sync method";
+      callback = CreateError(env_, errorMsg.c_str());
+      isSync = true;
+    } else {
+      isSync = false;
+    }
     NAPI_STATUS_THROWS_VOID(napi_create_reference(env_, callback, 1, &callbackRef_));
     napi_value asyncResourceName;
     NAPI_STATUS_THROWS_VOID(napi_create_string_utf8(env_, resourceName,
@@ -353,6 +373,17 @@ struct BaseWorker {
     napi_queue_async_work(env_, asyncWork_);
   }
 
+  bool IsSync()
+  {
+    return isSync;
+  }
+
+  virtual napi_value DoExecuteSync(){
+    napi_value result;
+    napi_get_undefined(env_, &result);
+    return result;
+  };
+
   napi_env env_;
   napi_ref callbackRef_;
   napi_async_work asyncWork_;
@@ -361,6 +392,7 @@ struct BaseWorker {
 private:
   leveldb::Status status_;
   char *errMsg_;
+  bool isSync;
 };
 
 /**
@@ -462,7 +494,14 @@ struct Database {
 
   void DecrementPriorityWork () {
     if (--priorityWork_ == 0 && pendingCloseWorker_ != NULL) {
-      pendingCloseWorker_->Queue();
+      if (pendingCloseWorker_->IsSync())
+      {
+        pendingCloseWorker_->DoExecuteSync();
+      }
+      else
+      {
+        pendingCloseWorker_->Queue();
+      }
       pendingCloseWorker_ = NULL;
     }
   }
@@ -830,6 +869,14 @@ struct OpenWorker final : public BaseWorker {
     SetStatus(database_->Open(options_, readOnly_, location_.c_str()));
   }
 
+  napi_value DoExecuteSync() override
+  {
+    rocksdb::Status status = database_->Open(options_, readOnly_, location_.c_str());
+    napi_value result;
+    napi_get_boolean(env_, status.ok(), &result);
+    return result;
+  }
+
   leveldb::Options options_;
   bool readOnly_;
   std::string location_;
@@ -866,6 +913,13 @@ NAPI_METHOD(db_open) {
                                       maxOpenFiles, blockRestartInterval,
                                       maxFileSize, cacheSize,
                                       infoLogLevel, readOnly);
+
+  if (worker->IsSync())
+  {
+    napi_value status = worker->DoExecuteSync();
+    delete[] location;
+    return status;
+  }
   worker->Queue();
   delete [] location;
 
@@ -886,6 +940,14 @@ struct CloseWorker final : public BaseWorker {
   void DoExecute () override {
     database_->CloseDatabase();
   }
+
+  napi_value DoExecuteSync() override
+  {
+    database_->CloseDatabase();
+    napi_value result;
+    napi_get_boolean(env_, true, &result);
+    return result;
+  }
 };
 
 napi_value noop_callback (napi_env env, napi_callback_info info) {
@@ -902,21 +964,40 @@ NAPI_METHOD(db_close) {
   napi_value callback = argv[1];
   CloseWorker* worker = new CloseWorker(env, database, callback);
 
-  if (!database->HasPriorityWork()) {
-    worker->Queue();
-    NAPI_RETURN_UNDEFINED();
+  if (!worker->IsSync())
+  {
+    if (!database->HasPriorityWork())
+    {
+      worker->Queue();
+      NAPI_RETURN_UNDEFINED();
+    }
   }
 
   database->pendingCloseWorker_ = worker;
 
   napi_value noop;
+  napi_value undefined;
   napi_create_function(env, NULL, 0, noop_callback, NULL, &noop);
+  napi_get_undefined(env, &undefined);
 
   std::map<uint32_t, Iterator*> iterators = database->iterators_;
   std::map<uint32_t, Iterator*>::iterator it;
 
-  for (it = iterators.begin(); it != iterators.end(); ++it) {
-    iterator_end_do(env, it->second, noop);
+  for (it = iterators.begin(); it != iterators.end(); ++it)
+  {
+    if (worker->IsSync())
+    {
+      iterator_end_do(env, it->second, undefined);
+    }
+    else
+    {
+      iterator_end_do(env, it->second, noop);
+    }
+  }
+
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
   }
 
   NAPI_RETURN_UNDEFINED();
@@ -946,6 +1027,14 @@ struct PutWorker final : public PriorityWorker {
     SetStatus(database_->Put(options_, key_, value_));
   }
 
+  napi_value DoExecuteSync() override
+  {
+    rocksdb::Status status = database_->Put(options_, key_, value_);
+    napi_value result;
+    napi_get_boolean(env_, status.ok(), &result);
+    return result;
+  }
+
   leveldb::WriteOptions options_;
   leveldb::Slice key_;
   leveldb::Slice value_;
@@ -960,10 +1049,14 @@ NAPI_METHOD(db_put) {
 
   leveldb::Slice key = ToSlice(env, argv[1]);
   leveldb::Slice value = ToSlice(env, argv[2]);
-  bool sync = BooleanProperty(env, argv[3], "sync", false);
   napi_value callback = argv[4];
+  bool sync = BooleanProperty(env, argv[3], "sync", IsNotFunction(env, callback));
 
   PutWorker* worker = new PutWorker(env, database, callback, key, value, sync);
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -991,6 +1084,21 @@ struct GetWorker final : public PriorityWorker {
 
   void DoExecute () override {
     SetStatus(database_->Get(options_, key_, value_));
+  }
+
+  napi_value DoExecuteSync()
+  {
+    database_->Get(options_, key_, value_);
+    napi_value argv[1];
+    if (asBuffer_)
+    {
+      napi_create_buffer_copy(env_, value_.size(), value_.data(), NULL, &argv[0]);
+    }
+    else
+    {
+      napi_create_string_utf8(env_, value_.data(), value_.size(), &argv[0]);
+    }
+    return argv[0];
   }
 
   void HandleOKCallback () override {
@@ -1029,6 +1137,10 @@ NAPI_METHOD(db_get) {
 
   GetWorker* worker = new GetWorker(env, database, callback, key, asBuffer,
                                     fillCache);
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -1056,6 +1168,14 @@ struct DelWorker final : public PriorityWorker {
     SetStatus(database_->Del(options_, key_));
   }
 
+  napi_value DoExecuteSync() override
+  {
+    rocksdb::Status status = database_->Del(options_, key_);
+    napi_value result;
+    napi_get_boolean(env_, status.ok(), &result);
+    return result;
+  }
+
   leveldb::WriteOptions options_;
   leveldb::Slice key_;
 };
@@ -1068,10 +1188,15 @@ NAPI_METHOD(db_del) {
   NAPI_DB_CONTEXT();
 
   leveldb::Slice key = ToSlice(env, argv[1]);
-  bool sync = BooleanProperty(env, argv[2], "sync", false);
   napi_value callback = argv[3];
+  bool sync = BooleanProperty(env, argv[2], "sync", IsNotFunction(env, callback));
 
   DelWorker* worker = new DelWorker(env, database, callback, key, sync);
+
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -1097,6 +1222,15 @@ struct ApproximateSizeWorker final : public PriorityWorker {
   void DoExecute () override {
     leveldb::Range range(start_, end_);
     size_ = database_->ApproximateSize(&range);
+  }
+
+  napi_value DoExecuteSync() override
+  {
+    rocksdb::Range range(start_, end_);
+    size_ = database_->ApproximateSize(&range);
+    napi_value argv[1];
+    napi_create_uint32(env_, (uint32_t)size_, &argv[0]);
+    return argv[0];
   }
 
   void HandleOKCallback () override {
@@ -1128,6 +1262,10 @@ NAPI_METHOD(db_approximate_size) {
   ApproximateSizeWorker* worker  = new ApproximateSizeWorker(env, database,
                                                              callback, start,
                                                              end);
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -1154,6 +1292,14 @@ struct CompactRangeWorker final : public PriorityWorker {
     database_->CompactRange(&start_, &end_);
   }
 
+  napi_value DoExecuteSync() override
+  {
+    database_->CompactRange(&start_, &end_);
+    napi_value result;
+    napi_get_boolean(env_, true, &result);
+    return result;
+  }
+
   leveldb::Slice start_;
   leveldb::Slice end_;
 };
@@ -1171,6 +1317,10 @@ NAPI_METHOD(db_compact_range) {
 
   CompactRangeWorker* worker  = new CompactRangeWorker(env, database, callback,
                                                        start, end);
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -1218,6 +1368,20 @@ struct DestroyWorker final : public BaseWorker {
     SetStatus(leveldb::DestroyDB(location_, options));
   }
 
+  napi_value DoExecuteSync()
+  {
+    rocksdb::Options options;
+
+    // TODO: support overriding infoLogLevel the same as db.open(options)
+    options.info_log_level = rocksdb::InfoLogLevel::HEADER_LEVEL;
+    options.info_log.reset(new NullLogger());
+
+    rocksdb::Status status = rocksdb::DestroyDB(location_, options);
+    napi_value result;
+    napi_get_boolean(env_, status.ok(), &result);
+    return result;
+  }
+
   std::string location_;
 };
 
@@ -1230,6 +1394,14 @@ NAPI_METHOD(destroy_db) {
   napi_value callback = argv[1];
 
   DestroyWorker* worker = new DestroyWorker(env, location, callback);
+
+  if (worker->IsSync())
+  {
+    napi_value status = worker->DoExecuteSync();
+    delete[] location;
+    return status;
+  }
+
   worker->Queue();
 
   delete [] location;
@@ -1259,6 +1431,20 @@ struct RepairWorker final : public BaseWorker {
     SetStatus(leveldb::RepairDB(location_, options));
   }
 
+  napi_value DoExecuteSync() override
+  {
+    rocksdb::Options options;
+
+    // TODO: support overriding infoLogLevel the same as db.open(options)
+    options.info_log_level = rocksdb::InfoLogLevel::HEADER_LEVEL;
+    options.info_log.reset(new NullLogger());
+
+    rocksdb::Status status = rocksdb::RepairDB(location_, options);
+    napi_value result;
+    napi_get_boolean(env_, status.ok(), &result);
+    return result;
+  }
+
   std::string location_;
 };
 
@@ -1271,6 +1457,14 @@ NAPI_METHOD(repair_db) {
   napi_value callback = argv[1];
 
   RepairWorker* worker = new RepairWorker(env, location, callback);
+
+  if (worker->IsSync())
+  {
+    napi_value status = worker->DoExecuteSync();
+    delete[] location;
+    return status;
+  }
+
   worker->Queue();
 
   delete [] location;
@@ -1410,6 +1604,14 @@ struct EndWorker final : public BaseWorker {
     iterator_->IteratorEnd();
   }
 
+  napi_value DoExecuteSync() override
+  {
+    iterator_->IteratorEnd();
+    napi_value result;
+    napi_get_boolean(env_, true, &result);
+    return result;
+  }
+
   void HandleOKCallback () override {
     napi_delete_reference(env_, iterator_->Detach());
     BaseWorker::HandleOKCallback();
@@ -1430,7 +1632,14 @@ static void iterator_end_do (napi_env env, Iterator* iterator, napi_value cb) {
     if (iterator->nexting_) {
       iterator->endWorker_ = worker;
     } else {
-      worker->Queue();
+      if (worker->IsSync())
+      {
+        worker->DoExecuteSync();
+      }
+      else
+      {
+        worker->Queue();
+      }
     }
   }
 }
@@ -1454,7 +1663,14 @@ NAPI_METHOD(iterator_end) {
 void CheckEndCallback (Iterator* iterator) {
   iterator->nexting_ = false;
   if (iterator->endWorker_ != NULL) {
-    iterator->endWorker_->Queue();
+    if (iterator->endWorker_->IsSync())
+    {
+      iterator->endWorker_->DoExecuteSync();
+    }
+    else
+    {
+      iterator->endWorker_->Queue();
+    }
     iterator->endWorker_ = NULL;
   }
 }
@@ -1479,6 +1695,64 @@ struct NextWorker final : public BaseWorker {
     if (!ok_) {
       SetStatus(iterator_->IteratorStatus());
     }
+  }
+
+  napi_value DoExecuteSync() override
+  {
+    ok_ = iterator_->IteratorNext(result_);
+    rocksdb::Status status;
+    if (!ok_)
+    {
+      status = iterator_->IteratorStatus();
+    }
+
+    size_t arraySize = result_.size() * 2;
+    napi_value jsArray;
+    napi_create_array_with_length(env_, arraySize, &jsArray);
+
+    for (size_t idx = 0; idx < result_.size(); ++idx)
+    {
+      std::pair<std::string, std::string> row = result_[idx];
+      std::string key = row.first;
+      std::string value = row.second;
+
+      napi_value returnKey;
+      if (iterator_->keyAsBuffer_)
+      {
+        napi_create_buffer_copy(env_, key.size(), key.data(), NULL, &returnKey);
+      }
+      else
+      {
+        napi_create_string_utf8(env_, key.data(), key.size(), &returnKey);
+      }
+
+      napi_value returnValue;
+      if (iterator_->valueAsBuffer_)
+      {
+        napi_create_buffer_copy(env_, value.size(), value.data(), NULL, &returnValue);
+      }
+      else
+      {
+        napi_create_string_utf8(env_, value.data(), value.size(), &returnValue);
+      }
+
+      // put the key & value in a descending order, so that they can be .pop:ed in javascript-land
+      napi_set_element(env_, jsArray, static_cast<int>(arraySize - idx * 2 - 1), returnKey);
+      napi_set_element(env_, jsArray, static_cast<int>(arraySize - idx * 2 - 2), returnValue);
+    }
+
+    // clean up & handle the next/end state
+    // TODO this should just do iterator_->CheckEndCallback();
+    localCallback_(iterator_);
+
+    napi_value argv[2];
+    argv[0] = jsArray;
+    napi_get_boolean(env_, !ok_, &argv[1]);
+    napi_value ret;
+    napi_create_array(env_, &ret);
+    napi_set_element(env_, ret, 0, argv[0]);
+    napi_set_element(env_, ret, 1, argv[1]);
+    return ret;
   }
 
   void HandleOKCallback () override {
@@ -1549,6 +1823,10 @@ NAPI_METHOD(iterator_next) {
   NextWorker* worker = new NextWorker(env, iterator, callback,
                                       CheckEndCallback);
   iterator->nexting_ = true;
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -1579,6 +1857,21 @@ struct BatchWorker final : public PriorityWorker {
     }
   }
 
+  napi_value DoExecuteSync() override
+  {
+    napi_value result;
+    if (hasData_)
+    {
+      rocksdb::Status status = database_->WriteBatch(options_, batch_);
+      napi_get_boolean(env_, status.ok(), &result);
+    }
+    else
+    {
+      napi_get_boolean(env_, false, &result);
+    }
+    return result;
+  }
+
   leveldb::WriteOptions options_;
   leveldb::WriteBatch* batch_;
   bool hasData_;
@@ -1592,8 +1885,8 @@ NAPI_METHOD(batch_do) {
   NAPI_DB_CONTEXT();
 
   napi_value array = argv[1];
-  bool sync = BooleanProperty(env, argv[2], "sync", false);
   napi_value callback = argv[3];
+  bool sync = BooleanProperty(env, argv[2], "sync", IsNotFunction(env, callback));
 
   uint32_t length;
   napi_get_array_length(env, array, &length);
@@ -1633,6 +1926,10 @@ NAPI_METHOD(batch_do) {
   }
 
   BatchWorker* worker = new BatchWorker(env, database, callback, batch, sync, hasData);
+  if (worker->IsSync())
+  {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -1770,6 +2067,21 @@ struct BatchWriteWorker final : public PriorityWorker {
     }
   }
 
+  napi_value DoExecuteSync() override
+  {
+    napi_value result;
+    if (batch_->hasData_)
+    {
+      rocksdb::Status status = batch_->Write(sync_);
+      napi_get_boolean(env_, status.ok(), &result);
+    }
+    else
+    {
+      napi_get_boolean(env_, false, &result);
+    }
+    return result;
+  }
+
   Batch* batch_;
   bool sync_;
 
@@ -1785,10 +2097,13 @@ NAPI_METHOD(batch_write) {
   NAPI_BATCH_CONTEXT();
 
   napi_value options = argv[1];
-  bool sync = BooleanProperty(env, options, "sync", false);
   napi_value callback = argv[2];
+  bool sync = BooleanProperty(env, options, "sync", IsNotFunction(env, callback));
 
   BatchWriteWorker* worker  = new BatchWriteWorker(env, argv[0], batch, callback, sync);
+  if(worker->IsSync()) {
+    return worker->DoExecuteSync();
+  }
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
