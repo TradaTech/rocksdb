@@ -1,8 +1,8 @@
 const util = require('util')
 const AbstractLevelDOWN = require('./abstract-leveldown/abstract-leveldown')
 const binding = require('./binding')
-const ChainedBatch = require('./chained-batch')
-const Iterator = require('./iterator')
+const ChainedBatch = require('./chained-batch-sync')
+const Iterator = require('./iterator-sync')
 
 function LevelDOWN (location) {
   if (!(this instanceof LevelDOWN)) {
