@@ -6,6 +6,8 @@ function AbstractIterator (db) {
   this.db = db
   this._ended = false
   this._nexting = false
+  this._key = undefined
+  this._value = undefined
 }
 
 AbstractIterator.prototype.next = function (callback) {
@@ -16,26 +18,31 @@ AbstractIterator.prototype.next = function (callback) {
   }
 
   if (self._ended) {
-    process.nextTick(callback, new Error('cannot call next() after end()'))
-    return self
+    // process.nextTick(callback, new Error('cannot call next() after end()'))
+    // return self
+    throw new Error('cannot call next() after end()')
   }
 
   if (self._nexting) {
-    process.nextTick(callback, new Error('cannot call next() before previous next() has completed'))
-    return self
+    // process.nextTick(callback, new Error('cannot call next() before previous next() has completed'))
+    // return self
+    throw new Error('cannot call next() before previous next() has completed')
   }
 
   self._nexting = true
-  self._next(function () {
-    self._nexting = false
-    callback.apply(null, arguments)
-  })
+  self._next()
+  self._nexting = false
 
   return self
 }
 
 AbstractIterator.prototype._next = function (callback) {
   process.nextTick(callback)
+}
+
+AbstractIterator.prototype.value = function () {
+  var self = this
+  return [self._key, self._value]
 }
 
 AbstractIterator.prototype.seek = function (target) {

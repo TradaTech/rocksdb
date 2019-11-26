@@ -26,17 +26,18 @@ Iterator.prototype._next = function (callback) {
   var that = this
 
   if (this.cache && this.cache.length) {
-    process.nextTick(callback, null, this.cache.pop(), this.cache.pop())
+    // process.nextTick(callback, null, this.cache.pop(), this.cache.pop())
+    that._key = this.cache.pop()
+    that._value = this.cache.pop()
   } else if (this.finished) {
-    process.nextTick(callback)
+    // process.nextTick(callback)
+    that._key = undefined
+    that._value = undefined
   } else {
-    binding.iterator_next(this.context, function (err, array, finished) {
-      if (err) return callback(err)
-
-      that.cache = array
-      that.finished = finished
-      that._next(callback)
-    })
+    const [array, finished] = binding.iterator_next(this.context)
+    that.cache = array
+    that.finished = finished
+    that._next(callback)
   }
 
   return this

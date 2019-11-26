@@ -962,14 +962,9 @@ NAPI_METHOD(db_close) {
   NAPI_DB_CONTEXT();
 
   napi_value callback = argv[1];
-  napi_value status;
   CloseWorker* worker = new CloseWorker(env, database, callback);
 
-  if (worker->IsSync())
-  {
-    status = worker->DoExecuteSync();
-  }
-  else
+  if (!worker->IsSync())
   {
     if (!database->HasPriorityWork())
     {
@@ -1002,7 +997,7 @@ NAPI_METHOD(db_close) {
 
   if (worker->IsSync())
   {
-    return status;
+    return worker->DoExecuteSync();
   }
 
   NAPI_RETURN_UNDEFINED();
