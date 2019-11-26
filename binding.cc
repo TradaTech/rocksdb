@@ -112,11 +112,11 @@ static bool IsObject (napi_env env, napi_value value) {
 /**
  * Returns true if 'value' is nil.
  */
-static bool IsNil(napi_env env, napi_value value)
+static bool IsNotFunction(napi_env env, napi_value value)
 {
   napi_valuetype type;
   napi_typeof(env, value, &type);
-  return type == napi_null || type == napi_undefined;
+  return type != napi_function;
 }
 
 
@@ -295,7 +295,7 @@ struct BaseWorker {
               const char* resourceName)
     : env_(env), database_(database), errMsg_(NULL) {
     // sync method
-    if (IsNil(env_, callback))
+    if (IsNotFunction(env_, callback))
     {
       std::string errorMsg = "sync method";
       callback = CreateError(env_, errorMsg.c_str());
@@ -1055,7 +1055,7 @@ NAPI_METHOD(db_put) {
   leveldb::Slice key = ToSlice(env, argv[1]);
   leveldb::Slice value = ToSlice(env, argv[2]);
   napi_value callback = argv[4];
-  bool sync = BooleanProperty(env, argv[3], "sync", IsNil(env, callback));
+  bool sync = BooleanProperty(env, argv[3], "sync", IsNotFunction(env, callback));
 
   PutWorker* worker = new PutWorker(env, database, callback, key, value, sync);
   if (worker->IsSync())
@@ -1194,7 +1194,7 @@ NAPI_METHOD(db_del) {
 
   leveldb::Slice key = ToSlice(env, argv[1]);
   napi_value callback = argv[3];
-  bool sync = BooleanProperty(env, argv[2], "sync", IsNil(env, callback));
+  bool sync = BooleanProperty(env, argv[2], "sync", IsNotFunction(env, callback));
 
   DelWorker* worker = new DelWorker(env, database, callback, key, sync);
 
@@ -1887,7 +1887,7 @@ NAPI_METHOD(batch_do) {
 
   napi_value array = argv[1];
   napi_value callback = argv[3];
-  bool sync = BooleanProperty(env, argv[2], "sync", IsNil(env, callback));
+  bool sync = BooleanProperty(env, argv[2], "sync", IsNotFunction(env, callback));
 
   uint32_t length;
   napi_get_array_length(env, array, &length);
@@ -2099,7 +2099,7 @@ NAPI_METHOD(batch_write) {
 
   napi_value options = argv[1];
   napi_value callback = argv[2];
-  bool sync = BooleanProperty(env, options, "sync", IsNil(env, callback));
+  bool sync = BooleanProperty(env, options, "sync", IsNotFunction(env, callback));
 
   BatchWriteWorker* worker  = new BatchWriteWorker(env, argv[0], batch, callback, sync);
   if(worker->IsSync()) {
