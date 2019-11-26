@@ -8,19 +8,19 @@ function ChainedBatch (db) {
 }
 
 ChainedBatch.prototype._put = function (key, value) {
-  binding.batch_put(this.context, key, value)
+  return binding.batch_put(this.context, key, value)
 }
 
 ChainedBatch.prototype._del = function (key) {
-  binding.batch_del(this.context, key)
+  return binding.batch_del(this.context, key)
 }
 
 ChainedBatch.prototype._clear = function () {
-  binding.batch_clear(this.context)
+  return binding.batch_clear(this.context)
 }
 
 ChainedBatch.prototype._write = function (options, callback) {
-  binding.batch_write(this.context, options, callback)
+  return binding.batch_write(this.context, options, callback)
 }
 
 util.inherits(ChainedBatch, AbstractChainedBatch)

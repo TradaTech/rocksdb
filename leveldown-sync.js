@@ -34,11 +34,11 @@ function LevelDOWN (location) {
 util.inherits(LevelDOWN, AbstractLevelDOWN)
 
 LevelDOWN.prototype._open = function (options, callback) {
-  binding.db_open(this.context, this.location, options, callback)
+  return binding.db_open(this.context, this.location, options, callback)
 }
 
 LevelDOWN.prototype._close = function (callback) {
-  binding.db_close(this.context, callback)
+  return binding.db_close(this.context, callback)
 }
 
 LevelDOWN.prototype._serializeKey = function (key) {
@@ -50,15 +50,15 @@ LevelDOWN.prototype._serializeValue = function (value) {
 }
 
 LevelDOWN.prototype._put = function (key, value, options, callback) {
-  binding.db_put(this.context, key, value, options, callback)
+  return binding.db_put(this.context, key, value, options, callback)
 }
 
 LevelDOWN.prototype._get = function (key, options, callback) {
-  binding.db_get(this.context, key, options, callback)
+  return binding.db_get(this.context, key, options, callback)
 }
 
 LevelDOWN.prototype._del = function (key, options, callback) {
-  binding.db_del(this.context, key, options, callback)
+  return binding.db_del(this.context, key, options, callback)
 }
 
 LevelDOWN.prototype._chainedBatch = function () {
@@ -66,7 +66,7 @@ LevelDOWN.prototype._chainedBatch = function () {
 }
 
 LevelDOWN.prototype._batch = function (operations, options, callback) {
-  binding.batch_do(this.context, operations, options, callback)
+  return binding.batch_do(this.context, operations, options, callback)
 }
 
 LevelDOWN.prototype.approximateSize = function (start, end, callback) {
@@ -84,7 +84,7 @@ LevelDOWN.prototype.approximateSize = function (start, end, callback) {
   start = this._serializeKey(start)
   end = this._serializeKey(end)
 
-  binding.db_approximate_size(this.context, start, end, callback)
+  return binding.db_approximate_size(this.context, start, end, callback)
 }
 
 LevelDOWN.prototype.compactRange = function (start, end, callback) {
@@ -102,7 +102,7 @@ LevelDOWN.prototype.compactRange = function (start, end, callback) {
   start = this._serializeKey(start)
   end = this._serializeKey(end)
 
-  binding.db_compact_range(this.context, start, end, callback)
+  return binding.db_compact_range(this.context, start, end, callback)
 }
 
 LevelDOWN.prototype.getProperty = function (property) {
@@ -133,7 +133,7 @@ LevelDOWN.destroy = function (location, callback) {
     throw new Error('destroy() requires a callback function argument')
   }
 
-  binding.destroy_db(location, callback)
+  return binding.destroy_db(location, callback)
 }
 
 LevelDOWN.repair = function (location, callback) {
@@ -147,7 +147,7 @@ LevelDOWN.repair = function (location, callback) {
     throw new Error('repair() requires a callback function argument')
   }
 
-  binding.repair_db(location, callback)
+  return binding.repair_db(location, callback)
 }
 
 module.exports = LevelDOWN.default = LevelDOWN

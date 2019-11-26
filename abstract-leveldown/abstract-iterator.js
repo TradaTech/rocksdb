@@ -47,7 +47,7 @@ AbstractIterator.prototype.seek = function (target) {
   }
 
   target = this.db._serializeKey(target)
-  this._seek(target)
+  return this._seek(target)
 }
 
 AbstractIterator.prototype._seek = function (target) {}
@@ -62,7 +62,7 @@ AbstractIterator.prototype.end = function (callback) {
   }
 
   this._ended = true
-  this._end(callback)
+  return this._end(callback)
 }
 
 AbstractIterator.prototype._end = function (callback) {
