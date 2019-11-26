@@ -1753,7 +1753,11 @@ struct NextWorker final : public BaseWorker {
     napi_value argv[2];
     argv[0] = jsArray;
     napi_get_boolean(env_, !ok_, &argv[1]);
-    return argv[0];
+    napi_value ret;
+    napi_create_array(env_, &ret);
+    napi_set_element(env_, ret, 0, argv[0]);
+    napi_set_element(env_, ret, 1, argv[1]);
+    return ret;
   }
 
   void HandleOKCallback () override {
