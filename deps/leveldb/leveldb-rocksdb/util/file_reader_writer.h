@@ -46,6 +46,8 @@ class SequentialFileReader {
 
   Status Skip(uint64_t n);
 
+  void Rewind();
+
   SequentialFile* file() { return file_.get(); }
 
   bool use_direct_io() const { return file_->use_direct_io(); }
@@ -92,6 +94,10 @@ class RandomAccessFileReader {
 
   Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const;
 
+  Status Prefetch(uint64_t offset, size_t n) const {
+    return file_->Prefetch(offset, n);
+  }
+
   RandomAccessFile* file() { return file_.get(); }
 
   bool use_direct_io() const { return file_->use_direct_io(); }
@@ -134,7 +140,9 @@ class WritableFileWriter {
         rate_limiter_(options.rate_limiter),
         stats_(stats) {
     buf_.Alignment(writable_file_->GetRequiredBufferAlignment());
-    buf_.AllocateNewBuffer(std::min((size_t)65536, max_buffer_size_));
+    buf_.AllocateNewBuffer(use_direct_io()
+                               ? max_buffer_size_
+                               : std::min((size_t)65536, max_buffer_size_));
   }
 
   WritableFileWriter(const WritableFileWriter&) = delete;

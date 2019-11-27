@@ -14,12 +14,12 @@
 #include <inttypes.h>
 
 #include "db/builder.h"
-#include "util/iostats_context_imp.h"
-#include "util/perf_context_imp.h"
+#include "monitoring/iostats_context_imp.h"
+#include "monitoring/perf_context_imp.h"
+#include "monitoring/thread_status_updater.h"
+#include "monitoring/thread_status_util.h"
 #include "util/sst_file_manager_impl.h"
 #include "util/sync_point.h"
-#include "util/thread_status_updater.h"
-#include "util/thread_status_util.h"
 
 namespace rocksdb {
 Status DBImpl::SyncClosedLogs(JobContext* job_context) {
@@ -90,6 +90,12 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   flush_job.PickMemTable();
 
+#ifndef ROCKSDB_LITE
+  // may temporarily unlock and lock the mutex.
+  NotifyOnFlushBegin(cfd, &file_meta, mutable_cf_options, job_context->job_id,
+                     flush_job.GetTableProperties());
+#endif  // ROCKSDB_LITE
+
   Status s;
   if (logfile_number_ > 0 &&
       versions_->GetColumnFamilySet()->NumberOfColumnFamilies() > 0) {
@@ -154,6 +160,49 @@ Status DBImpl::FlushMemTableToOutputFile(
 #endif  // ROCKSDB_LITE
   }
   return s;
+}
+
+void DBImpl::NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
+                                const MutableCFOptions& mutable_cf_options,
+                                int job_id, TableProperties prop) {
+#ifndef ROCKSDB_LITE
+  if (immutable_db_options_.listeners.size() == 0U) {
+    return;
+  }
+  mutex_.AssertHeld();
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  bool triggered_writes_slowdown =
+      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+       mutable_cf_options.level0_slowdown_writes_trigger);
+  bool triggered_writes_stop =
+      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+       mutable_cf_options.level0_stop_writes_trigger);
+  // release lock while notifying events
+  mutex_.Unlock();
+  {
+    FlushJobInfo info;
+    info.cf_name = cfd->GetName();
+    // TODO(yhchiang): make db_paths dynamic in case flush does not
+    //                 go to L0 in the future.
+    info.file_path = MakeTableFileName(immutable_db_options_.db_paths[0].path,
+                                       file_meta->fd.GetNumber());
+    info.thread_id = env_->GetThreadID();
+    info.job_id = job_id;
+    info.triggered_writes_slowdown = triggered_writes_slowdown;
+    info.triggered_writes_stop = triggered_writes_stop;
+    info.smallest_seqno = file_meta->smallest_seqno;
+    info.largest_seqno = file_meta->largest_seqno;
+    info.table_properties = prop;
+    for (auto listener : immutable_db_options_.listeners) {
+      listener->OnFlushBegin(this, info);
+    }
+  }
+  mutex_.Lock();
+// no need to signal bg_cv_ as it will be signaled at the end of the
+// flush process.
+#endif  // ROCKSDB_LITE
 }
 
 void DBImpl::NotifyOnFlushCompleted(ColumnFamilyData* cfd,
@@ -425,7 +474,7 @@ Status DBImpl::CompactFilesImpl(
   }
 
   for (auto inputs : input_files) {
-    if (cfd->compaction_picker()->FilesInCompaction(inputs.files)) {
+    if (cfd->compaction_picker()->AreFilesInCompaction(inputs.files)) {
       return Status::Aborted(
           "Some of the necessary compaction input "
           "files are already being compacted");
@@ -437,7 +486,7 @@ Status DBImpl::CompactFilesImpl(
 
   unique_ptr<Compaction> c;
   assert(cfd->compaction_picker());
-  c.reset(cfd->compaction_picker()->FormCompaction(
+  c.reset(cfd->compaction_picker()->CompactFiles(
       compact_options, input_files, output_level, version->storage_info(),
       *cfd->GetLatestMutableCFOptions(), output_path_id));
   if (!c) {
@@ -777,6 +826,7 @@ Status DBImpl::RunManualCompaction(ColumnFamilyData* cfd, int input_level,
   TEST_SYNC_POINT_CALLBACK("DBImpl::RunManualCompaction:NotScheduled", &mutex_);
   if (exclusive) {
     while (bg_compaction_scheduled_ > 0) {
+      TEST_SYNC_POINT("DBImpl::RunManualCompaction:WaitScheduled");
       ROCKS_LOG_INFO(
           immutable_db_options_.info_log,
           "[%s] Manual compaction waiting for all other scheduled background "
@@ -1343,6 +1393,16 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
                : m->manual_end->DebugString().c_str()));
     }
   } else if (!compaction_queue_.empty()) {
+    if (HaveManualCompaction(compaction_queue_.front())) {
+      // Can't compact right now, but try again later
+      TEST_SYNC_POINT("DBImpl::BackgroundCompaction()::Conflict");
+
+      // Stay in the compaciton queue.
+      unscheduled_compactions_++;
+
+      return Status::OK();
+    }
+
     // cfd is referenced here
     auto cfd = PopFirstFromCompactionQueue();
     // We unreference here because the following code will take a Ref() on
@@ -1354,12 +1414,6 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
       delete cfd;
       // This was the last reference of the column family, so no need to
       // compact.
-      return Status::OK();
-    }
-
-    if (HaveManualCompaction(cfd)) {
-      // Can't compact right now, but try again later
-      TEST_SYNC_POINT("DBImpl::BackgroundCompaction()::Conflict");
       return Status::OK();
     }
 

@@ -13,15 +13,15 @@
 #include "db/version_edit.h"
 #include "util/filename.h"
 
+#include "monitoring/perf_context_imp.h"
 #include "rocksdb/statistics.h"
+#include "table/get_context.h"
 #include "table/internal_iterator.h"
 #include "table/iterator_wrapper.h"
 #include "table/table_builder.h"
 #include "table/table_reader.h"
-#include "table/get_context.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
-#include "util/perf_context_imp.h"
 #include "util/stop_watch.h"
 #include "util/sync_point.h"
 
@@ -184,6 +184,11 @@ InternalIterator* TableCache::NewIterator(
     }
     size_t readahead = 0;
     if (for_compaction) {
+#ifndef NDEBUG
+      bool use_direct_reads_for_compaction = env_options.use_direct_reads;
+      TEST_SYNC_POINT_CALLBACK("TableCache::NewIterator:for_compaction",
+                               &use_direct_reads_for_compaction);
+#endif  // !NDEBUG
       if (ioptions_.new_table_reader_for_compaction_inputs) {
         readahead = ioptions_.compaction_readahead_size;
         create_new_table_reader = true;
@@ -217,7 +222,8 @@ InternalIterator* TableCache::NewIterator(
   }
   InternalIterator* result = nullptr;
   if (s.ok()) {
-    result = table_reader->NewIterator(options, arena, skip_filters);
+    result =
+      table_reader->NewIterator(options, arena, &icomparator, skip_filters);
     if (create_new_table_reader) {
       assert(handle == nullptr);
       result->RegisterCleanup(&DeleteTableReader, table_reader, nullptr);

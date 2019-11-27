@@ -74,13 +74,13 @@
 #include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "db/write_batch_internal.h"
+#include "options/cf_options.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/scoped_arena_iterator.h"
-#include "util/cf_options.h"
 #include "util/file_reader_writer.h"
 #include "util/filename.h"
 #include "util/string_util.h"
@@ -377,9 +377,11 @@ class Repairer {
       ro.total_order_seek = true;
       Arena arena;
       ScopedArenaIterator iter(mem->NewIterator(ro, &arena));
+      EnvOptions optimized_env_options =
+          env_->OptimizeForCompactionTableWrite(env_options_, immutable_db_options_);
       status = BuildTable(
           dbname_, env_, *cfd->ioptions(), *cfd->GetLatestMutableCFOptions(),
-          env_options_, table_cache_, iter.get(),
+          optimized_env_options, table_cache_, iter.get(),
           std::unique_ptr<InternalIterator>(mem->NewRangeTombstoneIterator(ro)),
           &meta, cfd->internal_comparator(),
           cfd->int_tbl_prop_collector_factories(), cfd->GetID(), cfd->GetName(),

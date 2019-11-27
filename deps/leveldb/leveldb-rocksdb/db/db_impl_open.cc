@@ -14,8 +14,8 @@
 #include <inttypes.h>
 
 #include "db/builder.h"
+#include "options/options_helper.h"
 #include "rocksdb/wal_filter.h"
-#include "util/options_helper.h"
 #include "util/sst_file_manager_impl.h"
 #include "util/sync_point.h"
 
@@ -97,11 +97,14 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
     result.db_paths.emplace_back(dbname, std::numeric_limits<uint64_t>::max());
   }
 
-  if (result.use_direct_reads && result.compaction_readahead_size == 0) {
+  if (result.use_direct_io_for_flush_and_compaction &&
+      result.compaction_readahead_size == 0) {
+    TEST_SYNC_POINT_CALLBACK("SanitizeOptions:direct_io", nullptr);
     result.compaction_readahead_size = 1024 * 1024 * 2;
   }
 
-  if (result.compaction_readahead_size > 0) {
+  if (result.compaction_readahead_size > 0 ||
+      result.use_direct_io_for_flush_and_compaction) {
     result.new_table_reader_for_compaction_inputs = true;
   }
 
@@ -165,10 +168,12 @@ static Status ValidateOptions(
         "then direct I/O reads (use_direct_reads) must be disabled. ");
   }
 
-  if (db_options.allow_mmap_writes && db_options.use_direct_writes) {
+  if (db_options.allow_mmap_writes &&
+      db_options.use_direct_io_for_flush_and_compaction) {
     return Status::NotSupported(
         "If memory mapped writes (allow_mmap_writes) are enabled "
-        "then direct I/O writes (use_direct_writes) must be disabled. ");
+        "then direct I/O writes (use_direct_io_for_flush_and_compaction) must "
+        "be disabled. ");
   }
 
   if (db_options.keep_log_file_num == 0) {
@@ -823,9 +828,11 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
       std::vector<SequenceNumber> snapshot_seqs =
           snapshots_.GetAll(&earliest_write_conflict_snapshot);
 
+      EnvOptions optimized_env_options =
+          env_->OptimizeForCompactionTableWrite(env_options_, immutable_db_options_);
       s = BuildTable(
-          dbname_, env_, *cfd->ioptions(), mutable_cf_options, env_options_,
-          cfd->table_cache(), iter.get(),
+          dbname_, env_, *cfd->ioptions(), mutable_cf_options,
+          optimized_env_options, cfd->table_cache(), iter.get(),
           std::unique_ptr<InternalIterator>(mem->NewRangeTombstoneIterator(ro)),
           &meta, cfd->internal_comparator(),
           cfd->int_tbl_prop_collector_factories(), cfd->GetID(), cfd->GetName(),
@@ -1025,7 +1032,8 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
   if (s.ok()) {
     // Persist RocksDB Options before scheduling the compaction.
     // The WriteOptionsFile() will release and lock the mutex internally.
-    persist_options_status = impl->WriteOptionsFile();
+    persist_options_status = impl->WriteOptionsFile(
+        false /*need_mutex_lock*/, false /*need_enter_write_thread*/);
 
     *dbptr = impl;
     impl->opened_successfully_ = true;
@@ -1058,14 +1066,9 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
     ROCKS_LOG_INFO(impl->immutable_db_options_.info_log, "DB pointer %p", impl);
     LogFlush(impl->immutable_db_options_.info_log);
     if (!persist_options_status.ok()) {
-      if (db_options.fail_if_options_file_error) {
-        s = Status::IOError(
-            "DB::Open() failed --- Unable to persist Options file",
-            persist_options_status.ToString());
-      }
-      ROCKS_LOG_WARN(impl->immutable_db_options_.info_log,
-                     "Unable to persist options in DB::Open() -- %s",
-                     persist_options_status.ToString().c_str());
+      s = Status::IOError(
+          "DB::Open() failed --- Unable to persist Options file",
+          persist_options_status.ToString());
     }
   }
   if (!s.ok()) {

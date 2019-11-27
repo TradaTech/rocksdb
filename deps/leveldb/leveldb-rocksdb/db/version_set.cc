@@ -32,6 +32,7 @@
 #include "db/pinned_iterators_manager.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
+#include "monitoring/perf_context_imp.h"
 #include "rocksdb/env.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/write_buffer_manager.h"
@@ -46,9 +47,8 @@
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
 #include "util/filename.h"
-#include "util/logging.h"
-#include "util/perf_context_imp.h"
 #include "util/stop_watch.h"
+#include "util/string_util.h"
 #include "util/sync_point.h"
 
 namespace rocksdb {
@@ -524,6 +524,13 @@ class LevelFileIteratorState : public TwoLevelIteratorState {
 
   bool PrefixMayMatch(const Slice& internal_key) override {
     return true;
+  }
+
+  bool KeyReachedUpperBound(const Slice& internal_key) override {
+    return read_options_.iterate_upper_bound != nullptr &&
+           icomparator_.user_comparator()->Compare(
+               ExtractUserKey(internal_key),
+               *read_options_.iterate_upper_bound) >= 0;
   }
 
  private:
@@ -1314,9 +1321,9 @@ void VersionStorageInfo::ComputeCompactionScore(
           // Level-based involves L0->L0 compactions that can lead to oversized
           // L0 files. Take into account size as well to avoid later giant
           // compactions to the base level.
-          uint64_t base_level_max_bytes = MaxBytesForLevel(base_level());
           score = std::max(
-              score, static_cast<double>(total_size) / base_level_max_bytes);
+              score, static_cast<double>(total_size) /
+                     mutable_cf_options.max_bytes_for_level_base);
         }
       }
     } else {
@@ -2218,7 +2225,8 @@ VersionSet::VersionSet(const std::string& dbname,
       current_version_number_(0),
       manifest_file_size_(0),
       env_options_(storage_options),
-      env_options_compactions_(env_options_) {}
+      env_options_compactions_(
+          env_->OptimizeForCompactionTableRead(env_options_, *db_options_)) {}
 
 void CloseTables(void* ptr, size_t) {
   TableReader* table_reader = reinterpret_cast<TableReader*>(ptr);
@@ -3477,7 +3485,7 @@ InternalIterator* VersionSet::MakeInputIterator(
         // Create concatenating iterator for the files from this level
         list[num++] = NewTwoLevelIterator(
             new LevelFileIteratorState(
-                cfd->table_cache(), read_options, env_options_,
+                cfd->table_cache(), read_options, env_options_compactions_,
                 cfd->internal_comparator(),
                 nullptr /* no per level latency histogram */,
                 true /* for_compaction */, false /* prefix enabled */,

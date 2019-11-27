@@ -34,6 +34,8 @@
 #include "db/write_controller.h"
 #include "db/write_thread.h"
 #include "memtable_list.h"
+#include "monitoring/instrumented_mutex.h"
+#include "options/db_options.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -43,10 +45,8 @@
 #include "rocksdb/write_buffer_manager.h"
 #include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
-#include "util/db_options.h"
 #include "util/event_logger.h"
 #include "util/hash.h"
-#include "util/instrumented_mutex.h"
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
 
@@ -100,10 +100,19 @@ class DBImpl : public DB {
       const std::vector<Slice>& keys,
       std::vector<std::string>* values) override;
 
-  virtual Status CreateColumnFamily(const ColumnFamilyOptions& options,
+  virtual Status CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                     const std::string& column_family,
                                     ColumnFamilyHandle** handle) override;
+  virtual Status CreateColumnFamilies(
+      const ColumnFamilyOptions& cf_options,
+      const std::vector<std::string>& column_family_names,
+      std::vector<ColumnFamilyHandle*>* handles) override;
+  virtual Status CreateColumnFamilies(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      std::vector<ColumnFamilyHandle*>* handles) override;
   virtual Status DropColumnFamily(ColumnFamilyHandle* column_family) override;
+  virtual Status DropColumnFamilies(
+      const std::vector<ColumnFamilyHandle*>& column_families) override;
 
   // Returns false if key doesn't exist in the database and true if it may.
   // If value_found is not passed in as null, then return the value if found in
@@ -192,7 +201,11 @@ class DBImpl : public DB {
 
   virtual SequenceNumber GetLatestSequenceNumber() const override;
 
+  bool HasActiveSnapshotLaterThanSN(SequenceNumber sn);
+
 #ifndef ROCKSDB_LITE
+  using DB::ResetStats;
+  virtual Status ResetStats() override;
   virtual Status DisableFileDeletions() override;
   virtual Status EnableFileDeletions(bool force) override;
   virtual int IsFileDeletionsEnabled() const;
@@ -452,6 +465,9 @@ class DBImpl : public DB {
   // mutex is released.
   ColumnFamilyHandle* GetColumnFamilyHandle(uint32_t column_family_id);
 
+  // Same as above, should called without mutex held and not on write thread.
+  ColumnFamilyHandle* GetColumnFamilyHandleUnlocked(uint32_t column_family_id);
+
   // Returns the number of currently running flushes.
   // REQUIREMENT: mutex_ must be held when calling this function.
   int num_running_flushes() {
@@ -547,15 +563,20 @@ class DBImpl : public DB {
                                         RangeDelAggregator* range_del_agg);
 
   // Except in DB::Open(), WriteOptionsFile can only be called when:
-  // 1. WriteThread::Writer::EnterUnbatched() is used.
-  // 2. db_mutex is held
-  Status WriteOptionsFile();
+  // Persist options to options file.
+  // If need_mutex_lock = false, the method will lock DB mutex.
+  // If need_enter_write_thread = false, the method will enter write thread.
+  Status WriteOptionsFile(bool need_mutex_lock, bool need_enter_write_thread);
 
   // The following two functions can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
   // 2. db_mutex is NOT held
   Status RenameTempFileToOptionsFile(const std::string& file_name);
   Status DeleteObsoleteOptionsFiles();
+
+  void NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
+                          const MutableCFOptions& mutable_cf_options,
+                          int job_id, TableProperties prop);
 
   void NotifyOnFlushCompleted(ColumnFamilyData* cfd, FileMetaData* file_meta,
                               const MutableCFOptions& mutable_cf_options,
@@ -627,6 +648,12 @@ class DBImpl : public DB {
   void MaybeIgnoreError(Status* s) const;
 
   const Status CreateArchivalDirectory();
+
+  Status CreateColumnFamilyImpl(const ColumnFamilyOptions& cf_options,
+                                const std::string& cf_name,
+                                ColumnFamilyHandle** handle);
+
+  Status DropColumnFamilyImpl(ColumnFamilyHandle* column_family);
 
   // Delete any unneeded files and stale in-memory entries.
   void DeleteObsoleteFiles();
@@ -1090,13 +1117,6 @@ class DBImpl : public DB {
   // No copying allowed
   DBImpl(const DBImpl&);
   void operator=(const DBImpl&);
-
-  // Return the earliest snapshot where seqno is visible.
-  // Store the snapshot right before that, if any, in prev_snapshot
-  inline SequenceNumber findEarliestVisibleSnapshot(
-    SequenceNumber in,
-    std::vector<SequenceNumber>& snapshots,
-    SequenceNumber* prev_snapshot);
 
   // Background threads call this function, which is just a wrapper around
   // the InstallSuperVersion() function. Background threads carry
