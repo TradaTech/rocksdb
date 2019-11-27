@@ -1,7 +1,7 @@
 // Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree. An additional grant
-// of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
@@ -21,7 +21,7 @@
 #include "util/threadpool_imp.h"
 
 #include <stdint.h>
-#include <Windows.h>
+#include <windows.h>
 
 #include <mutex>
 #include <vector>
@@ -47,8 +47,7 @@ public:
   WinEnvThreads& operator=(const WinEnvThreads&) = delete;
 
   void Schedule(void(*function)(void*), void* arg, Env::Priority pri,
-    void* tag,
-    void(*unschedFunction)(void* arg));
+                void* tag, void(*unschedFunction)(void* arg));
 
   int UnSchedule(void* arg, Env::Priority pri);
 
@@ -66,13 +65,14 @@ public:
 
   // Allow increasing the number of worker threads.
   void SetBackgroundThreads(int num, Env::Priority pri);
+  int GetBackgroundThreads(Env::Priority pri);
 
   void IncBackgroundThreadsIfNeeded(int num, Env::Priority pri);
 
 private:
 
-  Env*                     hosted_env_;
-  mutable std::mutex       mu_;
+  Env* hosted_env_;
+  mutable std::mutex mu_;
   std::vector<ThreadPoolImpl> thread_pools_;
   std::vector<WindowsThread> threads_to_join_;
 
@@ -88,32 +88,40 @@ public:
 
   virtual Status DeleteFile(const std::string& fname);
 
+  Status Truncate(const std::string& fname, size_t size);
+
   virtual Status GetCurrentTime(int64_t* unix_time);
 
   virtual Status NewSequentialFile(const std::string& fname,
-    std::unique_ptr<SequentialFile>* result,
-    const EnvOptions& options);
+                                   std::unique_ptr<SequentialFile>* result,
+                                   const EnvOptions& options);
+
+  // Helper for NewWritable and ReopenWritableFile
+  virtual Status OpenWritableFile(const std::string& fname,
+                                  std::unique_ptr<WritableFile>* result,
+                                  const EnvOptions& options,
+                                  bool reopen);
 
   virtual Status NewRandomAccessFile(const std::string& fname,
-    std::unique_ptr<RandomAccessFile>* result,
-    const EnvOptions& options);
-
-  virtual Status NewWritableFile(const std::string& fname,
-                                 std::unique_ptr<WritableFile>* result,
-                                 const EnvOptions& options);
+                                     std::unique_ptr<RandomAccessFile>* result,
+                                     const EnvOptions& options);
 
   // The returned file will only be accessed by one thread at a time.
   virtual Status NewRandomRWFile(const std::string& fname,
-    unique_ptr<RandomRWFile>* result,
-    const EnvOptions& options);
+                                 std::unique_ptr<RandomRWFile>* result,
+                                 const EnvOptions& options);
+
+  virtual Status NewMemoryMappedFileBuffer(
+      const std::string& fname,
+      std::unique_ptr<MemoryMappedFileBuffer>* result);
 
   virtual Status NewDirectory(const std::string& name,
-    std::unique_ptr<Directory>* result);
+                              std::unique_ptr<Directory>* result);
 
   virtual Status FileExists(const std::string& fname);
 
   virtual Status GetChildren(const std::string& dir,
-    std::vector<std::string>* result);
+                             std::vector<std::string>* result);
 
   virtual Status CreateDir(const std::string& name);
 
@@ -121,29 +129,31 @@ public:
 
   virtual Status DeleteDir(const std::string& name);
 
-  virtual Status GetFileSize(const std::string& fname,
-    uint64_t* size);
+  virtual Status GetFileSize(const std::string& fname, uint64_t* size);
 
   static uint64_t FileTimeToUnixTime(const FILETIME& ftTime);
 
   virtual Status GetFileModificationTime(const std::string& fname,
-    uint64_t* file_mtime);
+                                         uint64_t* file_mtime);
 
-  virtual Status RenameFile(const std::string& src,
-    const std::string& target);
+  virtual Status RenameFile(const std::string& src, const std::string& target);
 
-  virtual Status LinkFile(const std::string& src,
-    const std::string& target);
+  virtual Status LinkFile(const std::string& src, const std::string& target);
 
-  virtual Status LockFile(const std::string& lockFname,
-    FileLock** lock);
+  virtual Status NumFileLinks(const std::string& /*fname*/,
+                              uint64_t* /*count*/);
+
+  virtual Status AreFilesSame(const std::string& first,
+                              const std::string& second, bool* res);
+
+  virtual Status LockFile(const std::string& lockFname, FileLock** lock);
 
   virtual Status UnlockFile(FileLock* lock);
 
   virtual Status GetTestDirectory(std::string* result);
 
   virtual Status NewLogger(const std::string& fname,
-    std::shared_ptr<Logger>* result);
+                           std::shared_ptr<Logger>* result);
 
   virtual uint64_t NowMicros();
 
@@ -152,15 +162,18 @@ public:
   virtual Status GetHostName(char* name, uint64_t len);
 
   virtual Status GetAbsolutePath(const std::string& db_path,
-    std::string* output_path);
+                                 std::string* output_path);
 
   virtual std::string TimeToString(uint64_t secondsSince1970);
 
   virtual EnvOptions OptimizeForLogWrite(const EnvOptions& env_options,
-    const DBOptions& db_options) const;
+                                         const DBOptions& db_options) const;
 
   virtual EnvOptions OptimizeForManifestWrite(
-    const EnvOptions& env_options) const;
+      const EnvOptions& env_options) const;
+
+  virtual EnvOptions OptimizeForManifestRead(
+      const EnvOptions& env_options) const;
 
   size_t GetPageSize() const { return page_size_; }
 
@@ -168,16 +181,19 @@ public:
 
   uint64_t GetPerfCounterFrequency() const { return perf_counter_frequency_; }
 
+  static size_t GetSectorSize(const std::string& fname);
+
 private:
   // Returns true iff the named directory exists and is a directory.
   virtual bool DirExists(const std::string& dname);
 
   typedef VOID(WINAPI * FnGetSystemTimePreciseAsFileTime)(LPFILETIME);
 
-  Env*            hosted_env_;
-  size_t          page_size_;
-  size_t          allocation_granularity_;
-  uint64_t        perf_counter_frequency_;
+  Env* hosted_env_;
+  size_t page_size_;
+  size_t allocation_granularity_;
+  uint64_t perf_counter_frequency_;
+  uint64_t nano_seconds_per_period_;
   FnGetSystemTimePreciseAsFileTime GetSystemTimePreciseAsFileTime_;
 };
 
@@ -189,32 +205,49 @@ public:
 
   Status DeleteFile(const std::string& fname) override;
 
+  Status Truncate(const std::string& fname, size_t size) override;
+
   Status GetCurrentTime(int64_t* unix_time) override;
 
   Status NewSequentialFile(const std::string& fname,
-    std::unique_ptr<SequentialFile>* result,
-    const EnvOptions& options) override;
+                           std::unique_ptr<SequentialFile>* result,
+                           const EnvOptions& options) override;
 
   Status NewRandomAccessFile(const std::string& fname,
-    std::unique_ptr<RandomAccessFile>* result,
-    const EnvOptions& options) override;
+                             std::unique_ptr<RandomAccessFile>* result,
+                             const EnvOptions& options) override;
 
   Status NewWritableFile(const std::string& fname,
                          std::unique_ptr<WritableFile>* result,
                          const EnvOptions& options) override;
 
+  // Create an object that writes to a new file with the specified
+  // name.  Deletes any existing file with the same name and creates a
+  // new file.  On success, stores a pointer to the new file in
+  // *result and returns OK.  On failure stores nullptr in *result and
+  // returns non-OK.
+  //
+  // The returned file will only be accessed by one thread at a time.
+  Status ReopenWritableFile(const std::string& fname,
+                            std::unique_ptr<WritableFile>* result,
+                            const EnvOptions& options) override;
+
   // The returned file will only be accessed by one thread at a time.
   Status NewRandomRWFile(const std::string& fname,
-    unique_ptr<RandomRWFile>* result,
-    const EnvOptions& options) override;
+                         std::unique_ptr<RandomRWFile>* result,
+                         const EnvOptions& options) override;
+
+  Status NewMemoryMappedFileBuffer(
+      const std::string& fname,
+      std::unique_ptr<MemoryMappedFileBuffer>* result) override;
 
   Status NewDirectory(const std::string& name,
-    std::unique_ptr<Directory>* result) override;
+                      std::unique_ptr<Directory>* result) override;
 
   Status FileExists(const std::string& fname) override;
 
   Status GetChildren(const std::string& dir,
-    std::vector<std::string>* result) override;
+                     std::vector<std::string>* result) override;
 
   Status CreateDir(const std::string& name) override;
 
@@ -223,26 +256,30 @@ public:
   Status DeleteDir(const std::string& name) override;
 
   Status GetFileSize(const std::string& fname,
-    uint64_t* size) override;
+                     uint64_t* size) override;
 
   Status GetFileModificationTime(const std::string& fname,
-    uint64_t* file_mtime) override;
+                                 uint64_t* file_mtime) override;
 
   Status RenameFile(const std::string& src,
-    const std::string& target) override;
+                    const std::string& target) override;
 
   Status LinkFile(const std::string& src,
-    const std::string& target) override;
+                  const std::string& target) override;
 
-  Status LockFile(const std::string& lockFname,
-    FileLock** lock) override;
+  Status NumFileLinks(const std::string& fname, uint64_t* count) override;
+
+  Status AreFilesSame(const std::string& first,
+                      const std::string& second, bool* res) override;
+
+  Status LockFile(const std::string& lockFname, FileLock** lock) override;
 
   Status UnlockFile(FileLock* lock) override;
 
   Status GetTestDirectory(std::string* result) override;
 
   Status NewLogger(const std::string& fname,
-    std::shared_ptr<Logger>* result) override;
+                   std::shared_ptr<Logger>* result) override;
 
   uint64_t NowMicros() override;
 
@@ -251,16 +288,14 @@ public:
   Status GetHostName(char* name, uint64_t len) override;
 
   Status GetAbsolutePath(const std::string& db_path,
-    std::string* output_path) override;
+                         std::string* output_path) override;
 
   std::string TimeToString(uint64_t secondsSince1970) override;
 
-  Status GetThreadList(
-    std::vector<ThreadStatus>* thread_list) override;
+  Status GetThreadList(std::vector<ThreadStatus>* thread_list) override;
 
   void Schedule(void(*function)(void*), void* arg, Env::Priority pri,
-    void* tag,
-    void(*unschedFunction)(void* arg)) override;
+                void* tag, void(*unschedFunction)(void* arg)) override;
 
   int UnSchedule(void* arg, Env::Priority pri) override;
 
@@ -276,18 +311,23 @@ public:
 
   // Allow increasing the number of worker threads.
   void SetBackgroundThreads(int num, Env::Priority pri) override;
+  int GetBackgroundThreads(Env::Priority pri) override;
 
   void IncBackgroundThreadsIfNeeded(int num, Env::Priority pri) override;
 
+  EnvOptions OptimizeForManifestRead(
+      const EnvOptions& env_options) const override;
+
   EnvOptions OptimizeForLogWrite(const EnvOptions& env_options,
-    const DBOptions& db_options) const override;
+                                 const DBOptions& db_options) const override;
 
   EnvOptions OptimizeForManifestWrite(
-    const EnvOptions& env_options) const override;
+      const EnvOptions& env_options) const override;
+
 
 private:
 
-  WinEnvIO      winenv_io_;
+  WinEnvIO winenv_io_;
   WinEnvThreads winenv_threads_;
 };
 

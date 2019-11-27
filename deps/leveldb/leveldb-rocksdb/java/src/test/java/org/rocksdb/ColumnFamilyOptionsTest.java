@@ -1,12 +1,13 @@
 // Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree. An additional grant
-// of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 
 package org.rocksdb;
 
 import org.junit.ClassRule;
 import org.junit.Test;
+import org.rocksdb.test.RemoveEmptyValueCompactionFilterFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +24,18 @@ public class ColumnFamilyOptionsTest {
 
   public static final Random rand = PlatformRandomHelper.
       getPlatformSpecificRandomFactory();
+
+  @Test
+  public void copyConstructor() {
+    ColumnFamilyOptions origOpts = new ColumnFamilyOptions();
+    origOpts.setNumLevels(rand.nextInt(8));
+    origOpts.setTargetFileSizeMultiplier(rand.nextInt(100));
+    origOpts.setLevel0StopWritesTrigger(rand.nextInt(50));
+    ColumnFamilyOptions copyOpts = new ColumnFamilyOptions(origOpts);
+    assertThat(origOpts.numLevels()).isEqualTo(copyOpts.numLevels());
+    assertThat(origOpts.targetFileSizeMultiplier()).isEqualTo(copyOpts.targetFileSizeMultiplier());
+    assertThat(origOpts.level0StopWritesTrigger()).isEqualTo(copyOpts.level0StopWritesTrigger());
+  }
 
   @Test
   public void getColumnFamilyOptionsFromProps() {
@@ -452,6 +465,23 @@ public class ColumnFamilyOptionsTest {
   }
 
   @Test
+  public void bottommostCompressionOptions() {
+    try (final ColumnFamilyOptions columnFamilyOptions =
+             new ColumnFamilyOptions();
+         final CompressionOptions bottommostCompressionOptions =
+             new CompressionOptions()
+                 .setMaxDictBytes(123)) {
+
+      columnFamilyOptions.setBottommostCompressionOptions(
+          bottommostCompressionOptions);
+      assertThat(columnFamilyOptions.bottommostCompressionOptions())
+          .isEqualTo(bottommostCompressionOptions);
+      assertThat(columnFamilyOptions.bottommostCompressionOptions()
+          .maxDictBytes()).isEqualTo(123);
+    }
+  }
+
+  @Test
   public void compressionOptions() {
     try (final ColumnFamilyOptions columnFamilyOptions
              = new ColumnFamilyOptions();
@@ -530,6 +560,15 @@ public class ColumnFamilyOptionsTest {
   }
 
   @Test
+  public void ttl() {
+    try (final ColumnFamilyOptions options = new ColumnFamilyOptions()) {
+      options.setTtl(1000 * 60);
+      assertThat(options.ttl()).
+          isEqualTo(1000 * 60);
+    }
+  }
+
+  @Test
   public void compactionOptionsUniversal() {
     try (final ColumnFamilyOptions opt = new ColumnFamilyOptions();
         final CompactionOptionsUniversal optUni = new CompactionOptionsUniversal()
@@ -564,4 +603,23 @@ public class ColumnFamilyOptionsTest {
           isEqualTo(booleanValue);
     }
   }
+
+  @Test
+  public void compactionFilter() {
+    try(final ColumnFamilyOptions options = new ColumnFamilyOptions();
+        final RemoveEmptyValueCompactionFilter cf = new RemoveEmptyValueCompactionFilter()) {
+      options.setCompactionFilter(cf);
+      assertThat(options.compactionFilter()).isEqualTo(cf);
+    }
+  }
+
+  @Test
+  public void compactionFilterFactory() {
+    try(final ColumnFamilyOptions options = new ColumnFamilyOptions();
+        final RemoveEmptyValueCompactionFilterFactory cff = new RemoveEmptyValueCompactionFilterFactory()) {
+      options.setCompactionFilterFactory(cff);
+      assertThat(options.compactionFilterFactory()).isEqualTo(cff);
+    }
+  }
+
 }

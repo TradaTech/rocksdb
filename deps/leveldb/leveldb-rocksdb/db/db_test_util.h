@@ -1,7 +1,7 @@
 // Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree. An additional grant
-// of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -26,7 +26,7 @@
 
 #include "db/db_impl.h"
 #include "db/dbformat.h"
-#include "db/filename.h"
+#include "env/mock_env.h"
 #include "memtable/hash_linklist_rep.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
@@ -45,14 +45,12 @@
 #include "table/plain_table_factory.h"
 #include "table/scoped_arena_iterator.h"
 #include "util/compression.h"
-#include "util/mock_env.h"
+#include "util/filename.h"
+#include "util/mock_time_env.h"
 #include "util/mutexlock.h"
 
 #include "util/string_util.h"
-// SyncPoint is not supported in Released Windows Mode.
-#if !(defined NDEBUG) || !defined(OS_WIN)
 #include "util/sync_point.h"
-#endif  // !(defined NDEBUG) || !defined(OS_WIN)
 #include "util/testharness.h"
 #include "util/testutil.h"
 #include "utilities/merge_operators.h"
@@ -112,8 +110,6 @@ struct OptionsOverride {
   // These will be used only if filter_policy is set
   bool partition_filters = false;
   uint64_t metadata_block_size = 1024;
-  BlockBasedTableOptions::IndexType index_type =
-      BlockBasedTableOptions::IndexType::kBinarySearch;
 
   // Used as a bit mask of individual enums in which to skip an XF test point
   int skip_policy = 0;
@@ -126,8 +122,8 @@ enum SkipPolicy { kSkipNone = 0, kSkipNoSnapshot = 1, kSkipNoPrefix = 2 };
 // A hacky skip list mem table that triggers flush after number of entries.
 class SpecialMemTableRep : public MemTableRep {
  public:
-  explicit SpecialMemTableRep(MemTableAllocator* allocator,
-                              MemTableRep* memtable, int num_entries_flush)
+  explicit SpecialMemTableRep(Allocator* allocator, MemTableRep* memtable,
+                              int num_entries_flush)
       : MemTableRep(allocator),
         memtable_(memtable),
         num_entries_flush_(num_entries_flush),
@@ -140,8 +136,8 @@ class SpecialMemTableRep : public MemTableRep {
   // Insert key into the list.
   // REQUIRES: nothing that compares equal to key is currently in the list.
   virtual void Insert(KeyHandle handle) override {
-    memtable_->Insert(handle);
     num_entries_++;
+    memtable_->Insert(handle);
   }
 
   // Returns true iff an entry that compares equal to key is in the list.
@@ -173,7 +169,7 @@ class SpecialMemTableRep : public MemTableRep {
   virtual ~SpecialMemTableRep() override {}
 
  private:
-  unique_ptr<MemTableRep> memtable_;
+  std::unique_ptr<MemTableRep> memtable_;
   int num_entries_flush_;
   int num_entries_;
 };
@@ -187,9 +183,10 @@ class SpecialSkipListFactory : public MemTableRepFactory {
   explicit SpecialSkipListFactory(int num_entries_flush)
       : num_entries_flush_(num_entries_flush) {}
 
+  using MemTableRepFactory::CreateMemTableRep;
   virtual MemTableRep* CreateMemTableRep(
-      const MemTableRep::KeyComparator& compare, MemTableAllocator* allocator,
-      const SliceTransform* transform, Logger* logger) override {
+      const MemTableRep::KeyComparator& compare, Allocator* allocator,
+      const SliceTransform* transform, Logger* /*logger*/) override {
     return new SpecialMemTableRep(
         allocator, factory_.CreateMemTableRep(compare, allocator, transform, 0),
         num_entries_flush_);
@@ -210,15 +207,15 @@ class SpecialEnv : public EnvWrapper {
  public:
   explicit SpecialEnv(Env* base);
 
-  Status NewWritableFile(const std::string& f, unique_ptr<WritableFile>* r,
+  Status NewWritableFile(const std::string& f, std::unique_ptr<WritableFile>* r,
                          const EnvOptions& soptions) override {
     class SSTableFile : public WritableFile {
      private:
       SpecialEnv* env_;
-      unique_ptr<WritableFile> base_;
+      std::unique_ptr<WritableFile> base_;
 
      public:
-      SSTableFile(SpecialEnv* env, unique_ptr<WritableFile>&& base)
+      SSTableFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& base)
           : env_(env), base_(std::move(base)) {}
       Status Append(const Slice& data) override {
         if (env_->table_write_callback_) {
@@ -249,6 +246,13 @@ class SpecialEnv : public EnvWrapper {
         }
       }
       Status Truncate(uint64_t size) override { return base_->Truncate(size); }
+      Status RangeSync(uint64_t offset, uint64_t nbytes) override {
+        Status s = base_->RangeSync(offset, nbytes);
+#if !(defined NDEBUG) || !defined(OS_WIN)
+        TEST_SYNC_POINT_CALLBACK("SpecialEnv::SStableFile::RangeSync", &s);
+#endif  // !(defined NDEBUG) || !defined(OS_WIN)
+        return s;
+      }
       Status Close() override {
 // SyncPoint is not supported in Released Windows Mode.
 #if !(defined NDEBUG) || !defined(OS_WIN)
@@ -258,7 +262,11 @@ class SpecialEnv : public EnvWrapper {
         TEST_SYNC_POINT_CALLBACK("DBTestWritableFile.GetPreallocationStatus",
                                  &preallocation_size);
 #endif  // !(defined NDEBUG) || !defined(OS_WIN)
-        return base_->Close();
+        Status s = base_->Close();
+#if !(defined NDEBUG) || !defined(OS_WIN)
+        TEST_SYNC_POINT_CALLBACK("SpecialEnv::SStableFile::Close", &s);
+#endif  // !(defined NDEBUG) || !defined(OS_WIN)
+        return s;
       }
       Status Flush() override { return base_->Flush(); }
       Status Sync() override {
@@ -266,7 +274,11 @@ class SpecialEnv : public EnvWrapper {
         while (env_->delay_sstable_sync_.load(std::memory_order_acquire)) {
           env_->SleepForMicroseconds(100000);
         }
-        return base_->Sync();
+        Status s = base_->Sync();
+#if !(defined NDEBUG) || !defined(OS_WIN)
+        TEST_SYNC_POINT_CALLBACK("SpecialEnv::SStableFile::Sync", &s);
+#endif  // !(defined NDEBUG) || !defined(OS_WIN)
+        return s;
       }
       void SetIOPriority(Env::IOPriority pri) override {
         base_->SetIOPriority(pri);
@@ -277,10 +289,13 @@ class SpecialEnv : public EnvWrapper {
       bool use_direct_io() const override {
         return base_->use_direct_io();
       }
+      Status Allocate(uint64_t offset, uint64_t len) override {
+        return base_->Allocate(offset, len);
+      }
     };
     class ManifestFile : public WritableFile {
      public:
-      ManifestFile(SpecialEnv* env, unique_ptr<WritableFile>&& b)
+      ManifestFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
           : env_(env), base_(std::move(b)) {}
       Status Append(const Slice& data) override {
         if (env_->manifest_write_error_.load(std::memory_order_acquire)) {
@@ -301,14 +316,17 @@ class SpecialEnv : public EnvWrapper {
         }
       }
       uint64_t GetFileSize() override { return base_->GetFileSize(); }
+      Status Allocate(uint64_t offset, uint64_t len) override {
+        return base_->Allocate(offset, len);
+      }
 
      private:
       SpecialEnv* env_;
-      unique_ptr<WritableFile> base_;
+      std::unique_ptr<WritableFile> base_;
     };
     class WalFile : public WritableFile {
      public:
-      WalFile(SpecialEnv* env, unique_ptr<WritableFile>&& b)
+      WalFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
           : env_(env), base_(std::move(b)) {
         env_->num_open_wal_file_.fetch_add(1);
       }
@@ -354,10 +372,13 @@ class SpecialEnv : public EnvWrapper {
       bool IsSyncThreadSafe() const override {
         return env_->is_wal_sync_thread_safe_.load();
       }
+      Status Allocate(uint64_t offset, uint64_t len) override {
+        return base_->Allocate(offset, len);
+      }
 
      private:
       SpecialEnv* env_;
-      unique_ptr<WritableFile> base_;
+      std::unique_ptr<WritableFile> base_;
     };
 
     if (non_writeable_rate_.load(std::memory_order_acquire) > 0) {
@@ -399,11 +420,11 @@ class SpecialEnv : public EnvWrapper {
   }
 
   Status NewRandomAccessFile(const std::string& f,
-                             unique_ptr<RandomAccessFile>* r,
+                             std::unique_ptr<RandomAccessFile>* r,
                              const EnvOptions& soptions) override {
     class CountingFile : public RandomAccessFile {
      public:
-      CountingFile(unique_ptr<RandomAccessFile>&& target,
+      CountingFile(std::unique_ptr<RandomAccessFile>&& target,
                    anon::AtomicCounter* counter,
                    std::atomic<size_t>* bytes_read)
           : target_(std::move(target)),
@@ -417,8 +438,14 @@ class SpecialEnv : public EnvWrapper {
         return s;
       }
 
+      virtual Status Prefetch(uint64_t offset, size_t n) override {
+        Status s = target_->Prefetch(offset, n);
+        *bytes_read_ += n;
+        return s;
+      }
+
      private:
-      unique_ptr<RandomAccessFile> target_;
+      std::unique_ptr<RandomAccessFile> target_;
       anon::AtomicCounter* counter_;
       std::atomic<size_t>* bytes_read_;
     };
@@ -429,14 +456,18 @@ class SpecialEnv : public EnvWrapper {
       r->reset(new CountingFile(std::move(*r), &random_read_counter_,
                                 &random_read_bytes_counter_));
     }
+    if (s.ok() && soptions.compaction_readahead_size > 0) {
+      compaction_readahead_size_ = soptions.compaction_readahead_size;
+    }
     return s;
   }
 
-  Status NewSequentialFile(const std::string& f, unique_ptr<SequentialFile>* r,
-                           const EnvOptions& soptions) override {
+  virtual Status NewSequentialFile(const std::string& f,
+                                   std::unique_ptr<SequentialFile>* r,
+                                   const EnvOptions& soptions) override {
     class CountingFile : public SequentialFile {
      public:
-      CountingFile(unique_ptr<SequentialFile>&& target,
+      CountingFile(std::unique_ptr<SequentialFile>&& target,
                    anon::AtomicCounter* counter)
           : target_(std::move(target)), counter_(counter) {}
       virtual Status Read(size_t n, Slice* result, char* scratch) override {
@@ -446,7 +477,7 @@ class SpecialEnv : public EnvWrapper {
       virtual Status Skip(uint64_t n) override { return target_->Skip(n); }
 
      private:
-      unique_ptr<SequentialFile> target_;
+      std::unique_ptr<SequentialFile> target_;
       anon::AtomicCounter* counter_;
     };
 
@@ -476,6 +507,11 @@ class SpecialEnv : public EnvWrapper {
       *unix_time += addon_time_.load();
     }
     return s;
+  }
+
+  virtual uint64_t NowCPUNanos() override {
+    now_cpu_count_.fetch_add(1);
+    return target()->NowCPUNanos();
   }
 
   virtual uint64_t NowNanos() override {
@@ -547,13 +583,17 @@ class SpecialEnv : public EnvWrapper {
 
   std::atomic<int64_t> addon_time_;
 
+  std::atomic<int> now_cpu_count_;
+
   std::atomic<int> delete_count_;
 
-  bool time_elapse_only_sleep_;
+  std::atomic<bool> time_elapse_only_sleep_;
 
   bool no_slowdown_;
 
   std::atomic<bool> is_wal_sync_thread_safe_{true};
+
+  std::atomic<size_t> compaction_readahead_size_{};
 };
 
 #ifndef ROCKSDB_LITE
@@ -583,10 +623,32 @@ class OnFileDeletionListener : public EventListener {
 };
 #endif
 
+// A test merge operator mimics put but also fails if one of merge operands is
+// "corrupted".
+class TestPutOperator : public MergeOperator {
+ public:
+  virtual bool FullMergeV2(const MergeOperationInput& merge_in,
+                           MergeOperationOutput* merge_out) const override {
+    if (merge_in.existing_value != nullptr &&
+        *(merge_in.existing_value) == "corrupted") {
+      return false;
+    }
+    for (auto value : merge_in.operand_list) {
+      if (value == "corrupted") {
+        return false;
+      }
+    }
+    merge_out->existing_operand = merge_in.operand_list.back();
+    return true;
+  }
+
+  virtual const char* Name() const override { return "TestPutOperator"; }
+};
+
 class DBTestBase : public testing::Test {
- protected:
+ public:
   // Sequence of option configurations to try
-  enum OptionConfig {
+  enum OptionConfig : int {
     kDefault = 0,
     kBlockBasedTableWithPrefixHashIndex = 1,
     kBlockBasedTableWithWholeKeyHashIndex = 2,
@@ -596,45 +658,51 @@ class DBTestBase : public testing::Test {
     kPlainTableAllBytesPrefix = 6,
     kVectorRep = 7,
     kHashLinkList = 8,
-    kHashCuckoo = 9,
-    kMergePut = 10,
-    kFilter = 11,
-    kFullFilterWithNewTableReaderForCompactions = 12,
-    kUncompressed = 13,
-    kNumLevel_3 = 14,
-    kDBLogDir = 15,
-    kWalDirAndMmapReads = 16,
-    kManifestFileSize = 17,
-    kPerfOptions = 18,
-    kHashSkipList = 19,
-    kUniversalCompaction = 20,
-    kUniversalCompactionMultiLevel = 21,
-    kCompressedBlockCache = 22,
-    kInfiniteMaxOpenFiles = 23,
-    kxxHashChecksum = 24,
-    kFIFOCompaction = 25,
-    kOptimizeFiltersForHits = 26,
-    kRowCache = 27,
-    kRecycleLogFiles = 28,
-    kConcurrentSkipList = 29,
-    kEnd = 30,
-    kLevelSubcompactions = 31,
-    kUniversalSubcompactions = 32,
-    kBlockBasedTableWithIndexRestartInterval = 33,
-    kBlockBasedTableWithPartitionedIndex = 34,
-    kPartitionedFilterWithNewTableReaderForCompactions = 35,
+    kMergePut = 9,
+    kFilter = 10,
+    kFullFilterWithNewTableReaderForCompactions = 11,
+    kUncompressed = 12,
+    kNumLevel_3 = 13,
+    kDBLogDir = 14,
+    kWalDirAndMmapReads = 15,
+    kManifestFileSize = 16,
+    kPerfOptions = 17,
+    kHashSkipList = 18,
+    kUniversalCompaction = 19,
+    kUniversalCompactionMultiLevel = 20,
+    kCompressedBlockCache = 21,
+    kInfiniteMaxOpenFiles = 22,
+    kxxHashChecksum = 23,
+    kFIFOCompaction = 24,
+    kOptimizeFiltersForHits = 25,
+    kRowCache = 26,
+    kRecycleLogFiles = 27,
+    kConcurrentSkipList = 28,
+    kPipelinedWrite = 29,
+    kConcurrentWALWrites = 30,
+    kDirectIO,
+    kLevelSubcompactions,
+    kBlockBasedTableWithIndexRestartInterval,
+    kBlockBasedTableWithPartitionedIndex,
+    kBlockBasedTableWithPartitionedIndexFormat4,
+    kPartitionedFilterWithNewTableReaderForCompactions,
+    kUniversalSubcompactions,
+    kxxHash64Checksum,
+    // This must be the last line
+    kEnd,
   };
-  int option_config_;
 
  public:
   std::string dbname_;
   std::string alternative_wal_dir_;
   std::string alternative_db_log_dir_;
   MockEnv* mem_env_;
+  Env* encrypted_env_;
   SpecialEnv* env_;
   DB* db_;
   std::vector<ColumnFamilyHandle*> handles_;
 
+  int option_config_;
   Options last_options_;
 
   // Skip some options, as they may not be applicable to a specific test.
@@ -647,10 +715,16 @@ class DBTestBase : public testing::Test {
     kSkipPlainTable = 8,
     kSkipHashIndex = 16,
     kSkipNoSeekToLast = 32,
-    kSkipHashCuckoo = 64,
     kSkipFIFOCompaction = 128,
     kSkipMmapReads = 256,
   };
+
+  const int kRangeDelSkipConfigs =
+      // Plain tables do not support range deletions.
+      kSkipPlainTable |
+      // MmapReads disables the iterator pinning that RangeDelAggregator
+      // requires.
+      kSkipMmapReads;
 
   explicit DBTestBase(const std::string path);
 
@@ -684,13 +758,23 @@ class DBTestBase : public testing::Test {
   // Jump from kDefault to kFilter to kFullFilter
   bool ChangeFilterOptions();
 
-  // Return the current option configuration.
-  Options CurrentOptions(
-      const anon::OptionsOverride& options_override = anon::OptionsOverride());
+  // Switch between different DB options for file ingestion tests.
+  bool ChangeOptionsForFileIngestionTest();
 
-  Options CurrentOptions(
-      const Options& defaultOptions,
-      const anon::OptionsOverride& options_override = anon::OptionsOverride());
+  // Return the current option configuration.
+  Options CurrentOptions(const anon::OptionsOverride& options_override =
+                             anon::OptionsOverride()) const;
+
+  Options CurrentOptions(const Options& default_options,
+                         const anon::OptionsOverride& options_override =
+                             anon::OptionsOverride()) const;
+
+  static Options GetDefaultOptions();
+
+  Options GetOptions(int option_config,
+                     const Options& default_options = GetDefaultOptions(),
+                     const anon::OptionsOverride& options_override =
+                         anon::OptionsOverride()) const;
 
   DBImpl* dbfull() { return reinterpret_cast<DBImpl*>(db_); }
 
@@ -718,7 +802,7 @@ class DBTestBase : public testing::Test {
 
   void DestroyAndReopen(const Options& options);
 
-  void Destroy(const Options& options);
+  void Destroy(const Options& options, bool delete_cf_paths = false);
 
   Status ReadOnlyReopen(const Options& options);
 
@@ -726,7 +810,11 @@ class DBTestBase : public testing::Test {
 
   bool IsDirectIOSupported();
 
+  bool IsMemoryMappedAccessSupported() const;
+
   Status Flush(int cf = 0);
+
+  Status Flush(const std::vector<int>& cf_ids);
 
   Status Put(const Slice& k, const Slice& v, WriteOptions wo = WriteOptions());
 
@@ -747,10 +835,21 @@ class DBTestBase : public testing::Test {
 
   Status SingleDelete(int cf, const std::string& k);
 
+  bool SetPreserveDeletesSequenceNumber(SequenceNumber sn);
+
   std::string Get(const std::string& k, const Snapshot* snapshot = nullptr);
 
   std::string Get(int cf, const std::string& k,
                   const Snapshot* snapshot = nullptr);
+
+  Status Get(const std::string& k, PinnableSlice* v);
+
+  std::vector<std::string> MultiGet(std::vector<int> cfs,
+                                    const std::vector<std::string>& k,
+                                    const Snapshot* snapshot = nullptr);
+
+  std::vector<std::string> MultiGet(const std::vector<std::string>& k,
+                                    const Snapshot* snapshot = nullptr);
 
   uint64_t GetNumSnapshots();
 
@@ -772,13 +871,13 @@ class DBTestBase : public testing::Test {
   size_t TotalLiveFiles(int cf = 0);
 
   size_t CountLiveFiles();
-#endif  // ROCKSDB_LITE
 
   int NumTableFilesAtLevel(int level, int cf = 0);
 
   double CompressionRatioAtLevel(int level, int cf = 0);
 
   int TotalTableFiles(int cf = 0, int levels = -1);
+#endif  // ROCKSDB_LITE
 
   // Return spread of files per level
   std::string FilesPerLevel(int cf = 0);
@@ -806,11 +905,14 @@ class DBTestBase : public testing::Test {
 
   void MoveFilesToLevel(int level, int cf = 0);
 
+#ifndef ROCKSDB_LITE
   void DumpFileCounts(const char* label);
+#endif  // ROCKSDB_LITE
 
   std::string DumpSSTableList();
 
-  void GetSstFiles(std::string path, std::vector<std::string>* files);
+  static void GetSstFiles(Env* env, std::string path,
+                          std::vector<std::string>* files);
 
   int GetSstFileCount(std::string path);
 
