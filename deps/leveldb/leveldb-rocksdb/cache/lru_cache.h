@@ -1,7 +1,7 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -55,10 +55,18 @@ struct LRUHandle {
                      // cache itself is counted as 1
 
   // Include the following flags:
-  //   in_cache:    whether this entry is referenced by the hash table.
-  //   is_high_pri: whether this entry is high priority entry.
-  //   in_high_pro_pool: whether this entry is in high-pri pool.
-  char flags;
+  //   IN_CACHE:         whether this entry is referenced by the hash table.
+  //   IS_HIGH_PRI:      whether this entry is high priority entry.
+  //   IN_HIGH_PRI_POOL: whether this entry is in high-pri pool.
+  //   HAS_HIT:          whether this entry has had any lookups (hits).
+  enum Flags : uint8_t {
+    IN_CACHE = (1 << 0),
+    IS_HIGH_PRI = (1 << 1),
+    IN_HIGH_PRI_POOL = (1 << 2),
+    HAS_HIT = (1 << 3),
+  };
+
+  uint8_t flags;
 
   uint32_t hash;     // Hash of key(); used for fast sharding and comparisons
 
@@ -74,33 +82,36 @@ struct LRUHandle {
     }
   }
 
-  bool InCache() { return flags & 1; }
-  bool IsHighPri() { return flags & 2; }
-  bool InHighPriPool() { return flags & 4; }
+  bool InCache() const { return flags & IN_CACHE; }
+  bool IsHighPri() const { return flags & IS_HIGH_PRI; }
+  bool InHighPriPool() const { return flags & IN_HIGH_PRI_POOL; }
+  bool HasHit() const { return flags & HAS_HIT; }
 
   void SetInCache(bool in_cache) {
     if (in_cache) {
-      flags |= 1;
+      flags |= IN_CACHE;
     } else {
-      flags &= ~1;
+      flags &= ~IN_CACHE;
     }
   }
 
   void SetPriority(Cache::Priority priority) {
     if (priority == Cache::Priority::HIGH) {
-      flags |= 2;
+      flags |= IS_HIGH_PRI;
     } else {
-      flags &= ~2;
+      flags &= ~IS_HIGH_PRI;
     }
   }
 
   void SetInHighPriPool(bool in_high_pri_pool) {
     if (in_high_pri_pool) {
-      flags |= 4;
+      flags |= IN_HIGH_PRI_POOL;
     } else {
-      flags &= ~4;
+      flags &= ~IN_HIGH_PRI_POOL;
     }
   }
+
+  void SetHit() { flags |= HAS_HIT; }
 
   void Free() {
     assert((refs == 1 && InCache()) || (refs == 0 && !InCache()));
@@ -148,15 +159,16 @@ class LRUHandleTable {
 
   // The table consists of an array of buckets where each bucket is
   // a linked list of cache entries that hash into the bucket.
+  LRUHandle** list_;
   uint32_t length_;
   uint32_t elems_;
-  LRUHandle** list_;
 };
 
 // A single shard of sharded cache.
-class LRUCacheShard : public CacheShard {
+class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
  public:
-  LRUCacheShard();
+  LRUCacheShard(size_t capacity, bool strict_capacity_limit,
+                double high_pri_pool_ratio, bool use_adaptive_mutex);
   virtual ~LRUCacheShard();
 
   // Separate from constructor so caller can easily make an array of LRUCache
@@ -178,7 +190,8 @@ class LRUCacheShard : public CacheShard {
                         Cache::Priority priority) override;
   virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) override;
   virtual bool Ref(Cache::Handle* handle) override;
-  virtual void Release(Cache::Handle* handle) override;
+  virtual bool Release(Cache::Handle* handle,
+                       bool force_erase = false) override;
   virtual void Erase(const Slice& key, uint32_t hash) override;
 
   // Although in some platforms the update of size_t is atomic, to make sure
@@ -196,6 +209,13 @@ class LRUCacheShard : public CacheShard {
   virtual std::string GetPrintableOptions() const override;
 
   void TEST_GetLRUList(LRUHandle** lru, LRUHandle** lru_low_pri);
+
+  //  Retrieves number of elements in LRU, for unit test purpose only
+  //  not threadsafe
+  size_t TEST_GetLRUSize();
+
+  //  Retrives high pri pool ratio
+  double GetHighPriPoolRatio();
 
  private:
   void LRU_Remove(LRUHandle* e);
@@ -218,12 +238,6 @@ class LRUCacheShard : public CacheShard {
   // Initialized before use.
   size_t capacity_;
 
-  // Memory size for entries residing in the cache
-  size_t usage_;
-
-  // Memory size for entries residing only in the LRU list
-  size_t lru_usage_;
-
   // Memory size for entries in high-pri pool.
   size_t high_pri_pool_usage_;
 
@@ -237,11 +251,6 @@ class LRUCacheShard : public CacheShard {
   // Remember the value to avoid recomputing each time.
   double high_pri_pool_capacity_;
 
-  // mutex_ protects the following state.
-  // We don't count mutex_ as the cache's internal state so semantically we
-  // don't mind mutex_ invoking the non-const actions.
-  mutable port::Mutex mutex_;
-
   // Dummy head of LRU list.
   // lru.prev is newest entry, lru.next is oldest entry.
   // LRU contains items which can be evicted, ie reference only by cache
@@ -250,13 +259,41 @@ class LRUCacheShard : public CacheShard {
   // Pointer to head of low-pri pool in LRU list.
   LRUHandle* lru_low_pri_;
 
+  // ------------^^^^^^^^^^^^^-----------
+  // Not frequently modified data members
+  // ------------------------------------
+  //
+  // We separate data members that are updated frequently from the ones that
+  // are not frequently updated so that they don't share the same cache line
+  // which will lead into false cache sharing
+  //
+  // ------------------------------------
+  // Frequently modified data members
+  // ------------vvvvvvvvvvvvv-----------
   LRUHandleTable table_;
+
+  // Memory size for entries residing in the cache
+  size_t usage_;
+
+  // Memory size for entries residing only in the LRU list
+  size_t lru_usage_;
+
+  // mutex_ protects the following state.
+  // We don't count mutex_ as the cache's internal state so semantically we
+  // don't mind mutex_ invoking the non-const actions.
+  mutable port::Mutex mutex_;
 };
 
-class LRUCache : public ShardedCache {
+class LRUCache
+#ifdef NDEBUG
+    final
+#endif
+    : public ShardedCache {
  public:
   LRUCache(size_t capacity, int num_shard_bits, bool strict_capacity_limit,
-           double high_pri_pool_ratio);
+           double high_pri_pool_ratio,
+           std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
+           bool use_adaptive_mutex = kDefaultToAdaptiveMutex);
   virtual ~LRUCache();
   virtual const char* Name() const override { return "LRUCache"; }
   virtual CacheShard* GetShard(int shard) override;
@@ -266,8 +303,14 @@ class LRUCache : public ShardedCache {
   virtual uint32_t GetHash(Handle* handle) const override;
   virtual void DisownData() override;
 
+  //  Retrieves number of elements in LRU, for unit test purpose only
+  size_t TEST_GetLRUSize();
+  //  Retrives high pri pool ratio
+  double GetHighPriPoolRatio();
+
  private:
-  LRUCacheShard* shards_;
+  LRUCacheShard* shards_ = nullptr;
+  int num_shards_ = 0;
 };
 
 }  // namespace rocksdb

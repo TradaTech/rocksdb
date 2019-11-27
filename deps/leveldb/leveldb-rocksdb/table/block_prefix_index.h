@@ -1,7 +1,7 @@
 // Copyright (c) 2011-present, Facebook, Inc. All rights reserved.
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree. An additional grant
-// of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
 #include <stdint.h>
@@ -19,7 +19,6 @@ class SliceTransform;
 // that index block.
 class BlockPrefixIndex {
  public:
-
   // Maps a key to a list of data blocks that could potentially contain
   // the key, based on the prefix.
   // Returns the total number of relevant blocks, 0 means the key does
@@ -28,7 +27,7 @@ class BlockPrefixIndex {
 
   size_t ApproximateMemoryUsage() const {
     return sizeof(BlockPrefixIndex) +
-      (num_block_array_buffer_entries_ + num_buckets_) * sizeof(uint32_t);
+           (num_block_array_buffer_entries_ + num_buckets_) * sizeof(uint32_t);
   }
 
   // Create hash index by reading from the metadata blocks.
@@ -48,8 +47,7 @@ class BlockPrefixIndex {
   friend Builder;
 
   BlockPrefixIndex(const SliceTransform* internal_prefix_extractor,
-                   uint32_t num_buckets,
-                   uint32_t* buckets,
+                   uint32_t num_buckets, uint32_t* buckets,
                    uint32_t num_block_array_buffer_entries,
                    uint32_t* block_array_buffer)
       : internal_prefix_extractor_(internal_prefix_extractor),

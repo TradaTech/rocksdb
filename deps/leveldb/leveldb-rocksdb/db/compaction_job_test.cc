@@ -1,17 +1,24 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 
 #ifndef ROCKSDB_LITE
 
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
+
+#include <inttypes.h>
 #include <algorithm>
+#include <array>
 #include <map>
 #include <string>
 #include <tuple>
 
 #include "db/column_family.h"
 #include "db/compaction_job.h"
+#include "db/error_handler.h"
 #include "db/version_set.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
@@ -67,7 +74,7 @@ class CompactionJobTest : public testing::Test {
  public:
   CompactionJobTest()
       : env_(Env::Default()),
-        dbname_(test::TmpDir() + "/compaction_job_test"),
+        dbname_(test::PerThreadDBPath("compaction_job_test")),
         db_options_(),
         mutable_cf_options_(cf_options_),
         table_cache_(NewLRUCache(50000, 16)),
@@ -76,7 +83,9 @@ class CompactionJobTest : public testing::Test {
                                  table_cache_.get(), &write_buffer_manager_,
                                  &write_controller_)),
         shutting_down_(false),
-        mock_table_factory_(new mock::MockTableFactory()) {
+        preserve_deletes_seqnum_(0),
+        mock_table_factory_(new mock::MockTableFactory()),
+        error_handler_(nullptr, db_options_, &mutex_) {
     EXPECT_OK(env_->CreateDirIfMissing(dbname_));
     db_options_.db_paths.emplace_back(dbname_,
                                       std::numeric_limits<uint64_t>::max());
@@ -142,6 +151,8 @@ class CompactionJobTest : public testing::Test {
   }
 
   void SetLastSequence(const SequenceNumber sequence_number) {
+    versions_->SetLastAllocatedSequence(sequence_number + 1);
+    versions_->SetLastPublishedSequence(sequence_number + 1);
     versions_->SetLastSequence(sequence_number + 1);
   }
 
@@ -167,7 +178,7 @@ class CompactionJobTest : public testing::Test {
         // This is how the key will look like once it's written in bottommost
         // file
         InternalKey bottommost_internal_key(
-            key, (key == "9999") ? sequence_number : 0, kTypeValue);
+            key, 0, kTypeValue);
 
         if (corrupt_id(k)) {
           test::CorruptKeyType(&internal_key);
@@ -189,18 +200,25 @@ class CompactionJobTest : public testing::Test {
   }
 
   void NewDB() {
+    DestroyDB(dbname_, Options());
+    EXPECT_OK(env_->CreateDirIfMissing(dbname_));
+    versions_.reset(new VersionSet(dbname_, &db_options_, env_options_,
+                                   table_cache_.get(), &write_buffer_manager_,
+                                   &write_controller_));
+    compaction_job_stats_.Reset();
+
     VersionEdit new_db;
     new_db.SetLogNumber(0);
     new_db.SetNextFile(2);
     new_db.SetLastSequence(0);
 
     const std::string manifest = DescriptorFileName(dbname_, 1);
-    unique_ptr<WritableFile> file;
+    std::unique_ptr<WritableFile> file;
     Status s = env_->NewWritableFile(
         manifest, &file, env_->OptimizeForManifestWrite(env_options_));
     ASSERT_OK(s);
-    unique_ptr<WritableFileWriter> file_writer(
-        new WritableFileWriter(std::move(file), env_options_));
+    std::unique_ptr<WritableFileWriter> file_writer(
+        new WritableFileWriter(std::move(file), manifest, env_options_));
     {
       log::Writer log(std::move(file_writer), 0, false);
       std::string record;
@@ -225,7 +243,10 @@ class CompactionJobTest : public testing::Test {
       const std::vector<std::vector<FileMetaData*>>& input_files,
       const stl_wrappers::KVMap& expected_results,
       const std::vector<SequenceNumber>& snapshots = {},
-      SequenceNumber earliest_write_conflict_snapshot = kMaxSequenceNumber) {
+      SequenceNumber earliest_write_conflict_snapshot = kMaxSequenceNumber,
+      int output_level = 1, bool verify = true,
+      SnapshotListFetchCallback* snapshot_fetcher =
+          SnapshotListFetchCallback::kDisabled) {
     auto cfd = versions_->GetColumnFamilySet()->GetDefault();
 
     size_t num_input_files = 0;
@@ -242,19 +263,23 @@ class CompactionJobTest : public testing::Test {
 
     Compaction compaction(cfd->current()->storage_info(), *cfd->ioptions(),
                           *cfd->GetLatestMutableCFOptions(),
-                          compaction_input_files, 1, 1024 * 1024,
-                          10 * 1024 * 1024, 0, kNoCompression, {}, true);
+                          compaction_input_files, output_level, 1024 * 1024,
+                          10 * 1024 * 1024, 0, kNoCompression,
+                          cfd->ioptions()->compression_opts, 0, {}, true);
     compaction.SetInputVersion(cfd->current());
 
     LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL, db_options_.info_log.get());
     mutex_.Lock();
     EventLogger event_logger(db_options_.info_log.get());
+    // TODO(yiwu) add a mock snapshot checker and add test for it.
+    SnapshotChecker* snapshot_checker = nullptr;
     CompactionJob compaction_job(
         0, &compaction, db_options_, env_options_, versions_.get(),
-        &shutting_down_, &log_buffer, nullptr, nullptr, nullptr, &mutex_,
-        &bg_error_, snapshots, earliest_write_conflict_snapshot, table_cache_,
-        &event_logger, false, false, dbname_, &compaction_job_stats_);
-
+        &shutting_down_, preserve_deletes_seqnum_, &log_buffer, nullptr,
+        nullptr, nullptr, &mutex_, &error_handler_, snapshots,
+        earliest_write_conflict_snapshot, snapshot_checker, table_cache_,
+        &event_logger, false, false, dbname_, &compaction_job_stats_,
+        Env::Priority::USER, snapshot_fetcher);
     VerifyInitializationOfCompactionJobStats(compaction_job_stats_);
 
     compaction_job.Prepare();
@@ -266,15 +291,17 @@ class CompactionJobTest : public testing::Test {
     ASSERT_OK(compaction_job.Install(*cfd->GetLatestMutableCFOptions()));
     mutex_.Unlock();
 
-    if (expected_results.size() == 0) {
-      ASSERT_GE(compaction_job_stats_.elapsed_micros, 0U);
-      ASSERT_EQ(compaction_job_stats_.num_input_files, num_input_files);
-      ASSERT_EQ(compaction_job_stats_.num_output_files, 0U);
-    } else {
-      ASSERT_GE(compaction_job_stats_.elapsed_micros, 0U);
-      ASSERT_EQ(compaction_job_stats_.num_input_files, num_input_files);
-      ASSERT_EQ(compaction_job_stats_.num_output_files, 1U);
-      mock_table_factory_->AssertLatestFile(expected_results);
+    if (verify) {
+      if (expected_results.size() == 0) {
+        ASSERT_GE(compaction_job_stats_.elapsed_micros, 0U);
+        ASSERT_EQ(compaction_job_stats_.num_input_files, num_input_files);
+        ASSERT_EQ(compaction_job_stats_.num_output_files, 0U);
+      } else {
+        ASSERT_GE(compaction_job_stats_.elapsed_micros, 0U);
+        ASSERT_EQ(compaction_job_stats_.num_input_files, num_input_files);
+        ASSERT_EQ(compaction_job_stats_.num_output_files, 1U);
+        mock_table_factory_->AssertLatestFile(expected_results);
+      }
     }
   }
 
@@ -290,12 +317,13 @@ class CompactionJobTest : public testing::Test {
   std::unique_ptr<VersionSet> versions_;
   InstrumentedMutex mutex_;
   std::atomic<bool> shutting_down_;
+  SequenceNumber preserve_deletes_seqnum_;
   std::shared_ptr<mock::MockTableFactory> mock_table_factory_;
   CompactionJobStats compaction_job_stats_;
   ColumnFamilyData* cfd_;
   std::unique_ptr<CompactionFilter> compaction_filter_;
   std::shared_ptr<MergeOperator> merge_op_;
-  Status bg_error_;
+  ErrorHandler error_handler_;
 };
 
 TEST_F(CompactionJobTest, Simple) {
@@ -337,6 +365,24 @@ TEST_F(CompactionJobTest, SimpleDeletion) {
   RunCompaction({files}, expected_results);
 }
 
+TEST_F(CompactionJobTest, OutputNothing) {
+  NewDB();
+
+  auto file1 = mock::MakeMockFile({{KeyStr("a", 1U, kTypeValue), "val"}});
+
+  AddMockFile(file1);
+
+  auto file2 = mock::MakeMockFile({{KeyStr("a", 2U, kTypeDeletion), ""}});
+
+  AddMockFile(file2);
+
+  auto expected_results = mock::MakeMockFile();
+
+  SetLastSequence(4U);
+  auto files = cfd_->current()->storage_info()->LevelFiles(0);
+  RunCompaction({files}, expected_results);
+}
+
 TEST_F(CompactionJobTest, SimpleOverwrite) {
   NewDB();
 
@@ -352,7 +398,7 @@ TEST_F(CompactionJobTest, SimpleOverwrite) {
 
   auto expected_results =
       mock::MakeMockFile({{KeyStr("a", 0U, kTypeValue), "val2"},
-                          {KeyStr("b", 4U, kTypeValue), "val3"}});
+                          {KeyStr("b", 0U, kTypeValue), "val3"}});
 
   SetLastSequence(4U);
   auto files = cfd_->current()->storage_info()->LevelFiles(0);
@@ -405,7 +451,7 @@ TEST_F(CompactionJobTest, SimpleMerge) {
 
   auto expected_results =
       mock::MakeMockFile({{KeyStr("a", 0U, kTypeValue), "3,4,5"},
-                          {KeyStr("b", 2U, kTypeValue), "1,2"}});
+                          {KeyStr("b", 0U, kTypeValue), "1,2"}});
 
   SetLastSequence(5U);
   auto files = cfd_->current()->storage_info()->LevelFiles(0);
@@ -429,8 +475,7 @@ TEST_F(CompactionJobTest, NonAssocMerge) {
 
   auto expected_results =
       mock::MakeMockFile({{KeyStr("a", 0U, kTypeValue), "3,4,5"},
-                          {KeyStr("b", 2U, kTypeMerge), "2"},
-                          {KeyStr("b", 1U, kTypeMerge), "1"}});
+                          {KeyStr("b", 0U, kTypeValue), "1,2"}});
 
   SetLastSequence(5U);
   auto files = cfd_->current()->storage_info()->LevelFiles(0);
@@ -457,7 +502,7 @@ TEST_F(CompactionJobTest, MergeOperandFilter) {
 
   auto expected_results =
       mock::MakeMockFile({{KeyStr("a", 0U, kTypeValue), test::EncodeInt(8U)},
-                          {KeyStr("b", 2U, kTypeMerge), test::EncodeInt(2U)}});
+                          {KeyStr("b", 0U, kTypeValue), test::EncodeInt(2U)}});
 
   SetLastSequence(5U);
   auto files = cfd_->current()->storage_info()->LevelFiles(0);
@@ -720,7 +765,7 @@ TEST_F(CompactionJobTest, SingleDeleteZeroSeq) {
   AddMockFile(file2);
 
   auto expected_results = mock::MakeMockFile({
-      {KeyStr("dummy", 5U, kTypeValue), "val2"},
+      {KeyStr("dummy", 0U, kTypeValue), "val2"},
   });
 
   SetLastSequence(22U);
@@ -904,11 +949,110 @@ TEST_F(CompactionJobTest, CorruptionAfterDeletion) {
       mock::MakeMockFile({{test::KeyStr("A", 0U, kTypeValue), "val3"},
                           {test::KeyStr("a", 0U, kTypeValue, true), "val"},
                           {test::KeyStr("b", 0U, kTypeValue, true), "val"},
-                          {test::KeyStr("c", 1U, kTypeValue), "val2"}});
+                          {test::KeyStr("c", 0U, kTypeValue), "val2"}});
 
   SetLastSequence(6U);
   auto files = cfd_->current()->storage_info()->LevelFiles(0);
   RunCompaction({files}, expected_results);
+}
+
+// Test the snapshot fetcher in compaction
+TEST_F(CompactionJobTest, SnapshotRefresh) {
+  uint64_t time_seed = env_->NowMicros();
+  printf("time_seed is %" PRIu64 "\n", time_seed);  // would help to reproduce
+  Random64 rand(time_seed);
+  std::vector<SequenceNumber> db_snapshots;
+  class SnapshotListFetchCallbackTest : public SnapshotListFetchCallback {
+   public:
+    SnapshotListFetchCallbackTest(Env* env, Random64& rand,
+                                  std::vector<SequenceNumber>* snapshots)
+        : SnapshotListFetchCallback(env, 1 /*short time delay*/,
+                                    1 /*fetch after each key*/),
+          rand_(rand),
+          snapshots_(snapshots) {}
+    virtual void Refresh(std::vector<SequenceNumber>* snapshots,
+                         SequenceNumber) override {
+      assert(snapshots->size());
+      assert(snapshots_->size());
+      assert(snapshots_->size() == snapshots->size());
+      if (rand_.OneIn(2)) {
+        uint64_t release_index = rand_.Uniform(snapshots_->size());
+        snapshots_->erase(snapshots_->begin() + release_index);
+        *snapshots = *snapshots_;
+      }
+    }
+
+   private:
+    Random64 rand_;
+    std::vector<SequenceNumber>* snapshots_;
+  } snapshot_fetcher(env_, rand, &db_snapshots);
+
+  std::vector<std::pair<const std::string, std::string>> file1_kvs, file2_kvs;
+  std::array<ValueType, 4> types = {kTypeValue, kTypeDeletion,
+                                    kTypeSingleDeletion};
+  SequenceNumber last_seq = 0;
+  for (int i = 1; i < 100; i++) {
+    SequenceNumber seq = last_seq + 1;
+    last_seq = seq;
+    if (rand.OneIn(2)) {
+      auto type = types[rand.Uniform(types.size())];
+      file1_kvs.push_back(
+          {test::KeyStr("k" + ToString(i), seq, type), "v" + ToString(i)});
+    }
+  }
+  auto file1 = mock::MakeMockFile(file1_kvs);
+  for (int i = 1; i < 100; i++) {
+    SequenceNumber seq = last_seq + 1;
+    last_seq++;
+    if (rand.OneIn(2)) {
+      auto type = types[rand.Uniform(types.size())];
+      file2_kvs.push_back(
+          {test::KeyStr("k" + ToString(i), seq, type), "v" + ToString(i)});
+    }
+  }
+  auto file2 = mock::MakeMockFile(file2_kvs);
+  for (SequenceNumber i = 1; i < last_seq + 1; i++) {
+    if (rand.OneIn(5)) {
+      db_snapshots.push_back(i);
+    }
+  }
+
+  const bool kVerify = true;
+  const int output_level_0 = 0;
+  NewDB();
+  AddMockFile(file1);
+  AddMockFile(file2);
+  SetLastSequence(last_seq);
+  auto files = cfd_->current()->storage_info()->LevelFiles(0);
+  // put the output on L0 since it is easier to feed them again to the 2nd
+  // compaction
+  RunCompaction({files}, file1, db_snapshots, kMaxSequenceNumber,
+                output_level_0, !kVerify, &snapshot_fetcher);
+
+  // Now db_snapshots are changed. Run the compaction again without snapshot
+  // fetcher but with the updated snapshot list.
+  compaction_job_stats_.Reset();
+  files = cfd_->current()->storage_info()->LevelFiles(0);
+  RunCompaction({files}, file1, db_snapshots, kMaxSequenceNumber,
+                output_level_0 + 1, !kVerify);
+  // The result should be what we get if we run compaction without snapshot
+  // fetcher on the updated list of snapshots
+  auto expected = mock_table_factory_->output();
+
+  NewDB();
+  AddMockFile(file1);
+  AddMockFile(file2);
+  SetLastSequence(last_seq);
+  files = cfd_->current()->storage_info()->LevelFiles(0);
+  RunCompaction({files}, expected, db_snapshots, kMaxSequenceNumber,
+                output_level_0, !kVerify);
+  // The 2nd compaction above would get rid of useless delete markers. To get
+  // the output here exactly as what we got above after two compactions, we also
+  // run the compaction for 2nd time.
+  compaction_job_stats_.Reset();
+  files = cfd_->current()->storage_info()->LevelFiles(0);
+  RunCompaction({files}, expected, db_snapshots, kMaxSequenceNumber,
+                output_level_0 + 1, !kVerify);
 }
 
 }  // namespace rocksdb
@@ -921,7 +1065,7 @@ int main(int argc, char** argv) {
 #else
 #include <stdio.h>
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
   fprintf(stderr,
           "SKIPPED as CompactionJobStats is not supported in ROCKSDB_LITE\n");
   return 0;

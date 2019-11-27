@@ -1,7 +1,7 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 
 #include <algorithm>
 #include <string>
@@ -20,7 +20,7 @@ class MergeHelperTest : public testing::Test {
  public:
   MergeHelperTest() { env_ = Env::Default(); }
 
-  ~MergeHelperTest() = default;
+  ~MergeHelperTest() override = default;
 
   Status Run(SequenceNumber stop_before, bool at_bottom,
              SequenceNumber latest_snapshot = 0) {
@@ -130,7 +130,7 @@ TEST_F(MergeHelperTest, SingleOperand) {
 
   AddKeyVal("a", 50, kTypeMerge, test::EncodeInt(1U));
 
-  ASSERT_TRUE(Run(31, true).IsMergeInProgress());
+  ASSERT_TRUE(Run(31, false).IsMergeInProgress());
   ASSERT_FALSE(iter_->Valid());
   ASSERT_EQ(test::KeyStr("a", 50, kTypeMerge), merge_helper_->keys()[0]);
   ASSERT_EQ(test::EncodeInt(1U), merge_helper_->values()[0]);

@@ -1,7 +1,7 @@
 //  Copyright (c) 2016-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 
 #if !defined(ROCKSDB_LITE) && !defined(OS_WIN)
 
@@ -24,16 +24,23 @@ class ChrootEnv : public EnvWrapper {
  public:
   ChrootEnv(Env* base_env, const std::string& chroot_dir)
       : EnvWrapper(base_env) {
+#if defined(OS_AIX)
+    char resolvedName[PATH_MAX];
+    char* real_chroot_dir = realpath(chroot_dir.c_str(), resolvedName);
+#else
     char* real_chroot_dir = realpath(chroot_dir.c_str(), nullptr);
+#endif
     // chroot_dir must exist so realpath() returns non-nullptr.
     assert(real_chroot_dir != nullptr);
     chroot_dir_ = real_chroot_dir;
+#if !defined(OS_AIX)
     free(real_chroot_dir);
+#endif
   }
 
-  virtual Status NewSequentialFile(const std::string& fname,
-                                   std::unique_ptr<SequentialFile>* result,
-                                   const EnvOptions& options) override {
+  Status NewSequentialFile(const std::string& fname,
+                           std::unique_ptr<SequentialFile>* result,
+                           const EnvOptions& options) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -42,9 +49,9 @@ class ChrootEnv : public EnvWrapper {
                                          options);
   }
 
-  virtual Status NewRandomAccessFile(const std::string& fname,
-                                     unique_ptr<RandomAccessFile>* result,
-                                     const EnvOptions& options) override {
+  Status NewRandomAccessFile(const std::string& fname,
+                             std::unique_ptr<RandomAccessFile>* result,
+                             const EnvOptions& options) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -53,9 +60,9 @@ class ChrootEnv : public EnvWrapper {
                                            options);
   }
 
-  virtual Status NewWritableFile(const std::string& fname,
-                                 unique_ptr<WritableFile>* result,
-                                 const EnvOptions& options) override {
+  Status NewWritableFile(const std::string& fname,
+                         std::unique_ptr<WritableFile>* result,
+                         const EnvOptions& options) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -64,10 +71,10 @@ class ChrootEnv : public EnvWrapper {
                                        options);
   }
 
-  virtual Status ReuseWritableFile(const std::string& fname,
-                                   const std::string& old_fname,
-                                   unique_ptr<WritableFile>* result,
-                                   const EnvOptions& options) override {
+  Status ReuseWritableFile(const std::string& fname,
+                           const std::string& old_fname,
+                           std::unique_ptr<WritableFile>* result,
+                           const EnvOptions& options) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -81,9 +88,9 @@ class ChrootEnv : public EnvWrapper {
                                          options);
   }
 
-  virtual Status NewRandomRWFile(const std::string& fname,
-                                 unique_ptr<RandomRWFile>* result,
-                                 const EnvOptions& options) override {
+  Status NewRandomRWFile(const std::string& fname,
+                         std::unique_ptr<RandomRWFile>* result,
+                         const EnvOptions& options) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -92,8 +99,8 @@ class ChrootEnv : public EnvWrapper {
                                        options);
   }
 
-  virtual Status NewDirectory(const std::string& dir,
-                              unique_ptr<Directory>* result) override {
+  Status NewDirectory(const std::string& dir,
+                      std::unique_ptr<Directory>* result) override {
     auto status_and_enc_path = EncodePathWithNewBasename(dir);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -101,7 +108,7 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::NewDirectory(status_and_enc_path.second, result);
   }
 
-  virtual Status FileExists(const std::string& fname) override {
+  Status FileExists(const std::string& fname) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -109,8 +116,8 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::FileExists(status_and_enc_path.second);
   }
 
-  virtual Status GetChildren(const std::string& dir,
-                             std::vector<std::string>* result) override {
+  Status GetChildren(const std::string& dir,
+                     std::vector<std::string>* result) override {
     auto status_and_enc_path = EncodePath(dir);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -118,7 +125,7 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::GetChildren(status_and_enc_path.second, result);
   }
 
-  virtual Status GetChildrenFileAttributes(
+  Status GetChildrenFileAttributes(
       const std::string& dir, std::vector<FileAttributes>* result) override {
     auto status_and_enc_path = EncodePath(dir);
     if (!status_and_enc_path.first.ok()) {
@@ -128,7 +135,7 @@ class ChrootEnv : public EnvWrapper {
                                                  result);
   }
 
-  virtual Status DeleteFile(const std::string& fname) override {
+  Status DeleteFile(const std::string& fname) override {
     auto status_and_enc_path = EncodePath(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -136,7 +143,7 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::DeleteFile(status_and_enc_path.second);
   }
 
-  virtual Status CreateDir(const std::string& dirname) override {
+  Status CreateDir(const std::string& dirname) override {
     auto status_and_enc_path = EncodePathWithNewBasename(dirname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -144,7 +151,7 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::CreateDir(status_and_enc_path.second);
   }
 
-  virtual Status CreateDirIfMissing(const std::string& dirname) override {
+  Status CreateDirIfMissing(const std::string& dirname) override {
     auto status_and_enc_path = EncodePathWithNewBasename(dirname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -152,7 +159,7 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::CreateDirIfMissing(status_and_enc_path.second);
   }
 
-  virtual Status DeleteDir(const std::string& dirname) override {
+  Status DeleteDir(const std::string& dirname) override {
     auto status_and_enc_path = EncodePath(dirname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -160,8 +167,7 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::DeleteDir(status_and_enc_path.second);
   }
 
-  virtual Status GetFileSize(const std::string& fname,
-                             uint64_t* file_size) override {
+  Status GetFileSize(const std::string& fname, uint64_t* file_size) override {
     auto status_and_enc_path = EncodePath(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -169,8 +175,8 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::GetFileSize(status_and_enc_path.second, file_size);
   }
 
-  virtual Status GetFileModificationTime(const std::string& fname,
-                                         uint64_t* file_mtime) override {
+  Status GetFileModificationTime(const std::string& fname,
+                                 uint64_t* file_mtime) override {
     auto status_and_enc_path = EncodePath(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -179,8 +185,7 @@ class ChrootEnv : public EnvWrapper {
                                                file_mtime);
   }
 
-  virtual Status RenameFile(const std::string& src,
-                            const std::string& dest) override {
+  Status RenameFile(const std::string& src, const std::string& dest) override {
     auto status_and_src_enc_path = EncodePath(src);
     if (!status_and_src_enc_path.first.ok()) {
       return status_and_src_enc_path.first;
@@ -193,8 +198,7 @@ class ChrootEnv : public EnvWrapper {
                                   status_and_dest_enc_path.second);
   }
 
-  virtual Status LinkFile(const std::string& src,
-                          const std::string& dest) override {
+  Status LinkFile(const std::string& src, const std::string& dest) override {
     auto status_and_src_enc_path = EncodePath(src);
     if (!status_and_src_enc_path.first.ok()) {
       return status_and_src_enc_path.first;
@@ -207,7 +211,7 @@ class ChrootEnv : public EnvWrapper {
                                 status_and_dest_enc_path.second);
   }
 
-  virtual Status LockFile(const std::string& fname, FileLock** lock) override {
+  Status LockFile(const std::string& fname, FileLock** lock) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -218,7 +222,7 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::LockFile(status_and_enc_path.second, lock);
   }
 
-  virtual Status GetTestDirectory(std::string* path) override {
+  Status GetTestDirectory(std::string* path) override {
     // Adapted from PosixEnv's implementation since it doesn't provide a way to
     // create directory in the chroot.
     char buf[256];
@@ -230,8 +234,8 @@ class ChrootEnv : public EnvWrapper {
     return Status::OK();
   }
 
-  virtual Status NewLogger(const std::string& fname,
-                           shared_ptr<Logger>* result) override {
+  Status NewLogger(const std::string& fname,
+                   std::shared_ptr<Logger>* result) override {
     auto status_and_enc_path = EncodePathWithNewBasename(fname);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -239,8 +243,8 @@ class ChrootEnv : public EnvWrapper {
     return EnvWrapper::NewLogger(status_and_enc_path.second, result);
   }
 
-  virtual Status GetAbsolutePath(const std::string& db_path,
-                                 std::string* output_path) override {
+  Status GetAbsolutePath(const std::string& db_path,
+                         std::string* output_path) override {
     auto status_and_enc_path = EncodePath(db_path);
     if (!status_and_enc_path.first.ok()) {
       return status_and_enc_path.first;
@@ -258,7 +262,12 @@ class ChrootEnv : public EnvWrapper {
     }
     std::pair<Status, std::string> res;
     res.second = chroot_dir_ + path;
+#if defined(OS_AIX)
+    char resolvedName[PATH_MAX];
+    char* normalized_path = realpath(res.second.c_str(), resolvedName);
+#else
     char* normalized_path = realpath(res.second.c_str(), nullptr);
+#endif
     if (normalized_path == nullptr) {
       res.first = Status::NotFound(res.second, strerror(errno));
     } else if (strlen(normalized_path) < chroot_dir_.size() ||
@@ -269,7 +278,9 @@ class ChrootEnv : public EnvWrapper {
     } else {
       res.first = Status::OK();
     }
+#if !defined(OS_AIX)
     free(normalized_path);
+#endif
     return res;
   }
 

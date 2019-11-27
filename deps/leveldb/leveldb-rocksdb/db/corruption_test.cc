@@ -1,7 +1,7 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -20,9 +20,12 @@
 #include "db/log_format.h"
 #include "db/version_set.h"
 #include "rocksdb/cache.h"
+#include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
 #include "rocksdb/table.h"
 #include "rocksdb/write_batch.h"
+#include "table/block_based_table_builder.h"
+#include "table/meta_blocks.h"
 #include "util/filename.h"
 #include "util/string_util.h"
 #include "util/testharness.h"
@@ -36,7 +39,7 @@ class CorruptionTest : public testing::Test {
  public:
   test::ErrorEnv env_;
   std::string dbname_;
-  shared_ptr<Cache> tiny_cache_;
+  std::shared_ptr<Cache> tiny_cache_;
   Options options_;
   DB* db_;
 
@@ -47,7 +50,7 @@ class CorruptionTest : public testing::Test {
     tiny_cache_ = NewLRUCache(100, 4);
     options_.wal_recovery_mode = WALRecoveryMode::kTolerateCorruptedTailRecords;
     options_.env = &env_;
-    dbname_ = test::TmpDir() + "/corruption_test";
+    dbname_ = test::PerThreadDBPath("corruption_test");
     DestroyDB(dbname_, options_);
 
     db_ = nullptr;
@@ -59,9 +62,9 @@ class CorruptionTest : public testing::Test {
     options_.create_if_missing = false;
   }
 
-  ~CorruptionTest() {
-     delete db_;
-     DestroyDB(dbname_, Options());
+  ~CorruptionTest() override {
+    delete db_;
+    DestroyDB(dbname_, Options());
   }
 
   void CloseDb() {
@@ -152,7 +155,7 @@ class CorruptionTest : public testing::Test {
     struct stat sbuf;
     if (stat(fname.c_str(), &sbuf) != 0) {
       const char* msg = strerror(errno);
-      ASSERT_TRUE(false) << fname << ": " << msg;
+      FAIL() << fname << ": " << msg;
     }
 
     if (offset < 0) {
@@ -179,6 +182,9 @@ class CorruptionTest : public testing::Test {
     }
     s = WriteStringToFile(Env::Default(), contents, fname);
     ASSERT_TRUE(s.ok()) << s.ToString();
+    Options options;
+    EnvOptions env_options;
+    ASSERT_NOK(VerifySstFileChecksum(options, env_options, fname));
   }
 
   void Corrupt(FileType filetype, int offset, int bytes_to_corrupt) {
@@ -213,7 +219,7 @@ class CorruptionTest : public testing::Test {
         return;
       }
     }
-    ASSERT_TRUE(false) << "no file found at level";
+    FAIL() << "no file found at level";
   }
 
 
@@ -312,6 +318,7 @@ TEST_F(CorruptionTest, TableFile) {
 
   Corrupt(kTableFile, 100, 1);
   Check(99, 99);
+  ASSERT_NOK(dbi->VerifyChecksum());
 }
 
 TEST_F(CorruptionTest, TableFileIndexData) {
@@ -327,9 +334,11 @@ TEST_F(CorruptionTest, TableFileIndexData) {
   // corrupt an index block of an entire file
   Corrupt(kTableFile, -2000, 500);
   Reopen();
-  // one full file should be readable, since only one was corrupted
+  dbi = reinterpret_cast<DBImpl*>(db_);
+  // one full file may be readable, since only one was corrupted
   // the other file should be fully non-readable, since index was corrupted
-  Check(5000, 5000);
+  Check(0, 5000);
+  ASSERT_NOK(dbi->VerifyChecksum());
 }
 
 TEST_F(CorruptionTest, MissingDescriptor) {
@@ -389,10 +398,12 @@ TEST_F(CorruptionTest, CompactionInputError) {
 
   Corrupt(kTableFile, 100, 1);
   Check(9, 9);
+  ASSERT_NOK(dbi->VerifyChecksum());
 
   // Force compactions by writing lots of values
   Build(10000);
   Check(10000, 10000);
+  ASSERT_NOK(dbi->VerifyChecksum());
 }
 
 TEST_F(CorruptionTest, CompactionInputErrorParanoid) {
@@ -424,6 +435,7 @@ TEST_F(CorruptionTest, CompactionInputErrorParanoid) {
 
   CorruptTableFileAtLevel(0, 100, 1);
   Check(9, 9);
+  ASSERT_NOK(dbi->VerifyChecksum());
 
   // Write must eventually fail because of corrupted table
   Status s;
@@ -445,6 +457,7 @@ TEST_F(CorruptionTest, UnrelatedKeys) {
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
   dbi->TEST_FlushMemTable();
   Corrupt(kTableFile, 100, 1);
+  ASSERT_NOK(dbi->VerifyChecksum());
 
   std::string tmp1, tmp2;
   ASSERT_OK(db_->Put(WriteOptions(), Key(1000, &tmp1), Value(1000, &tmp2)));
@@ -454,6 +467,39 @@ TEST_F(CorruptionTest, UnrelatedKeys) {
   dbi->TEST_FlushMemTable();
   ASSERT_OK(db_->Get(ReadOptions(), Key(1000, &tmp1), &v));
   ASSERT_EQ(Value(1000, &tmp2).ToString(), v);
+}
+
+TEST_F(CorruptionTest, RangeDeletionCorrupted) {
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "a", "b"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  std::vector<LiveFileMetaData> metadata;
+  db_->GetLiveFilesMetaData(&metadata);
+  ASSERT_EQ(static_cast<size_t>(1), metadata.size());
+  std::string filename = dbname_ + metadata[0].name;
+
+  std::unique_ptr<RandomAccessFile> file;
+  ASSERT_OK(options_.env->NewRandomAccessFile(filename, &file, EnvOptions()));
+  std::unique_ptr<RandomAccessFileReader> file_reader(
+      new RandomAccessFileReader(std::move(file), filename));
+
+  uint64_t file_size;
+  ASSERT_OK(options_.env->GetFileSize(filename, &file_size));
+
+  BlockHandle range_del_handle;
+  ASSERT_OK(FindMetaBlock(
+      file_reader.get(), file_size, kBlockBasedTableMagicNumber,
+      ImmutableCFOptions(options_), kRangeDelBlock, &range_del_handle));
+
+  ASSERT_OK(TryReopen());
+  CorruptFile(filename, static_cast<int>(range_del_handle.offset()), 1);
+  // The test case does not fail on TryReopen because failure to preload table
+  // handlers is not considered critical.
+  ASSERT_OK(TryReopen());
+  std::string val;
+  // However, it does fail on any read involving that file since that file
+  // cannot be opened with a corrupt range deletion meta-block.
+  ASSERT_TRUE(db_->Get(ReadOptions(), "a", &val).IsCorruption());
 }
 
 TEST_F(CorruptionTest, FileSystemStateCorrupted) {
@@ -474,7 +520,7 @@ TEST_F(CorruptionTest, FileSystemStateCorrupted) {
     db_ = nullptr;
 
     if (iter == 0) {  // corrupt file size
-      unique_ptr<WritableFile> file;
+      std::unique_ptr<WritableFile> file;
       env_.NewWritableFile(filename, &file, EnvOptions());
       file->Append(Slice("corrupted sst"));
       file.reset();
@@ -499,7 +545,7 @@ int main(int argc, char** argv) {
 #else
 #include <stdio.h>
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
   fprintf(stderr, "SKIPPED as RepairDB() is not supported in ROCKSDB_LITE\n");
   return 0;
 }

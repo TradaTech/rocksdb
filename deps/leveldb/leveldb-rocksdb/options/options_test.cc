@@ -1,7 +1,7 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -16,24 +16,29 @@
 #include <unordered_map>
 #include <inttypes.h>
 
+#include "cache/lru_cache.h"
+#include "cache/sharded_cache.h"
 #include "options/options_helper.h"
 #include "options/options_parser.h"
 #include "options/options_sanity_check.h"
+#include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/utilities/leveldb_options.h"
+#include "rocksdb/utilities/object_registry.h"
 #include "util/random.h"
 #include "util/stderr_logger.h"
 #include "util/string_util.h"
 #include "util/testharness.h"
 #include "util/testutil.h"
+#include "utilities/merge_operators/bytesxor.h"
 
 #ifndef GFLAGS
 bool FLAGS_enable_print = false;
 #else
-#include <gflags/gflags.h>
-using GFLAGS::ParseCommandLineFlags;
+#include "util/gflags_compat.h"
+using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 DEFINE_bool(enable_print, false, "Print options generated to console.");
 #endif  // GFLAGS
 
@@ -60,7 +65,8 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
        "kZSTD:"
        "kZSTDNotFinalCompression"},
       {"bottommost_compression", "kLZ4Compression"},
-      {"compression_opts", "4:5:6:7"},
+      {"bottommost_compression_opts", "5:6:7:8:9:true"},
+      {"compression_opts", "4:5:6:7:8:true"},
       {"num_levels", "8"},
       {"level0_file_num_compaction_trigger", "8"},
       {"level0_slowdown_writes_trigger", "9"},
@@ -68,6 +74,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"target_file_size_base", "12"},
       {"target_file_size_multiplier", "13"},
       {"max_bytes_for_level_base", "14"},
+      {"snap_refresh_nanos", "1000000000"},
       {"level_compaction_dynamic_level_bytes", "true"},
       {"max_bytes_for_level_multiplier", "15.0"},
       {"max_bytes_for_level_multiplier_additional", "16:17:18"},
@@ -87,6 +94,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"compaction_measure_io_stats", "false"},
       {"inplace_update_num_locks", "25"},
       {"memtable_prefix_bloom_size_ratio", "0.26"},
+      {"memtable_whole_key_filtering", "true"},
       {"memtable_huge_page_size", "28"},
       {"bloom_locality", "29"},
       {"max_successive_merges", "30"},
@@ -124,6 +132,8 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"is_fd_close_on_exec", "true"},
       {"skip_log_error_on_recovery", "false"},
       {"stats_dump_period_sec", "46"},
+      {"stats_persist_period_sec", "57"},
+      {"stats_history_buffer_size", "69"},
       {"advise_random_on_open", "true"},
       {"use_adaptive_mutex", "false"},
       {"new_table_reader_for_compaction_inputs", "true"},
@@ -132,6 +142,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"writable_file_max_buffer_size", "314159"},
       {"bytes_per_sync", "47"},
       {"wal_bytes_per_sync", "48"},
+      {"strict_bytes_per_sync", "true"},
   };
 
   ColumnFamilyOptions base_cf_opt;
@@ -157,7 +168,15 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.compression_opts.level, 5);
   ASSERT_EQ(new_cf_opt.compression_opts.strategy, 6);
   ASSERT_EQ(new_cf_opt.compression_opts.max_dict_bytes, 7);
+  ASSERT_EQ(new_cf_opt.compression_opts.zstd_max_train_bytes, 8);
+  ASSERT_EQ(new_cf_opt.compression_opts.enabled, true);
   ASSERT_EQ(new_cf_opt.bottommost_compression, kLZ4Compression);
+  ASSERT_EQ(new_cf_opt.bottommost_compression_opts.window_bits, 5);
+  ASSERT_EQ(new_cf_opt.bottommost_compression_opts.level, 6);
+  ASSERT_EQ(new_cf_opt.bottommost_compression_opts.strategy, 7);
+  ASSERT_EQ(new_cf_opt.bottommost_compression_opts.max_dict_bytes, 8);
+  ASSERT_EQ(new_cf_opt.bottommost_compression_opts.zstd_max_train_bytes, 9);
+  ASSERT_EQ(new_cf_opt.bottommost_compression_opts.enabled, true);
   ASSERT_EQ(new_cf_opt.num_levels, 8);
   ASSERT_EQ(new_cf_opt.level0_file_num_compaction_trigger, 8);
   ASSERT_EQ(new_cf_opt.level0_slowdown_writes_trigger, 9);
@@ -165,6 +184,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.target_file_size_base, static_cast<uint64_t>(12));
   ASSERT_EQ(new_cf_opt.target_file_size_multiplier, 13);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_base, 14U);
+  ASSERT_EQ(new_cf_opt.snap_refresh_nanos, 1000000000U);
   ASSERT_EQ(new_cf_opt.level_compaction_dynamic_level_bytes, true);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier, 15.0);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier_additional.size(), 3U);
@@ -184,6 +204,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.inplace_update_support, true);
   ASSERT_EQ(new_cf_opt.inplace_update_num_locks, 25U);
   ASSERT_EQ(new_cf_opt.memtable_prefix_bloom_size_ratio, 0.26);
+  ASSERT_EQ(new_cf_opt.memtable_whole_key_filtering, true);
   ASSERT_EQ(new_cf_opt.memtable_huge_page_size, 28U);
   ASSERT_EQ(new_cf_opt.bloom_locality, 29U);
   ASSERT_EQ(new_cf_opt.max_successive_merges, 30U);
@@ -200,11 +221,22 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   cf_options_map["write_buffer_size"] = "1";
   ASSERT_OK(GetColumnFamilyOptionsFromMap(
             base_cf_opt, cf_options_map, &new_cf_opt));
-  cf_options_map["unknown_option"] = "1";
 
+  cf_options_map["unknown_option"] = "1";
   ASSERT_NOK(GetColumnFamilyOptionsFromMap(
              base_cf_opt, cf_options_map, &new_cf_opt));
   ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(base_cf_opt, new_cf_opt));
+
+  ASSERT_OK(GetColumnFamilyOptionsFromMap(base_cf_opt, cf_options_map,
+                                          &new_cf_opt,
+                                          false, /* input_strings_escaped  */
+                                          true /* ignore_unknown_options */));
+  ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(
+      base_cf_opt, new_cf_opt, nullptr, /* new_opt_map */
+      kSanityLevelLooselyCompatible /* from CheckOptionsCompatibility*/));
+  ASSERT_NOK(RocksDBOptionsParser::VerifyCFOptions(
+      base_cf_opt, new_cf_opt, nullptr, /* new_opt_map */
+      kSanityLevelExactMatch /* default for VerifyCFOptions */));
 
   DBOptions base_db_opt;
   DBOptions new_db_opt;
@@ -238,6 +270,8 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_db_opt.is_fd_close_on_exec, true);
   ASSERT_EQ(new_db_opt.skip_log_error_on_recovery, false);
   ASSERT_EQ(new_db_opt.stats_dump_period_sec, 46U);
+  ASSERT_EQ(new_db_opt.stats_persist_period_sec, 57U);
+  ASSERT_EQ(new_db_opt.stats_history_buffer_size, 69U);
   ASSERT_EQ(new_db_opt.advise_random_on_open, true);
   ASSERT_EQ(new_db_opt.use_adaptive_mutex, false);
   ASSERT_EQ(new_db_opt.new_table_reader_for_compaction_inputs, true);
@@ -246,6 +280,29 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_db_opt.writable_file_max_buffer_size, 314159);
   ASSERT_EQ(new_db_opt.bytes_per_sync, static_cast<uint64_t>(47));
   ASSERT_EQ(new_db_opt.wal_bytes_per_sync, static_cast<uint64_t>(48));
+  ASSERT_EQ(new_db_opt.strict_bytes_per_sync, true);
+
+  db_options_map["max_open_files"] = "hello";
+  ASSERT_NOK(GetDBOptionsFromMap(base_db_opt, db_options_map, &new_db_opt));
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(base_db_opt, new_db_opt));
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(
+      base_db_opt, new_db_opt, nullptr, /* new_opt_map */
+      kSanityLevelLooselyCompatible /* from CheckOptionsCompatibility */));
+
+  // unknow options should fail parsing without ignore_unknown_options = true
+  db_options_map["unknown_db_option"] = "1";
+  ASSERT_NOK(GetDBOptionsFromMap(base_db_opt, db_options_map, &new_db_opt));
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(base_db_opt, new_db_opt));
+
+  ASSERT_OK(GetDBOptionsFromMap(base_db_opt, db_options_map, &new_db_opt,
+                                false, /* input_strings_escaped  */
+                                true /* ignore_unknown_options */));
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(
+      base_db_opt, new_db_opt, nullptr, /* new_opt_map */
+      kSanityLevelLooselyCompatible /* from CheckOptionsCompatibility */));
+  ASSERT_NOK(RocksDBOptionsParser::VerifyDBOptions(
+      base_db_opt, new_db_opt, nullptr, /* new_opt_mat */
+      kSanityLevelExactMatch /* default for VerifyDBOptions */));
 }
 #endif  // !ROCKSDB_LITE
 
@@ -283,6 +340,34 @@ TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
              "write_buffer_size=13;max_write_buffer_number_=14;",
               &new_cf_opt));
   ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(base_cf_opt, new_cf_opt));
+
+  // Comparator from object registry
+  std::string kCompName = "reverse_comp";
+  static Registrar<const Comparator> test_reg_a(
+      kCompName, [](const std::string& /*name*/,
+                    std::unique_ptr<const Comparator>* /*comparator_guard*/) {
+        return ReverseBytewiseComparator();
+      });
+
+  ASSERT_OK(GetColumnFamilyOptionsFromString(
+      base_cf_opt, "comparator=" + kCompName + ";", &new_cf_opt));
+  ASSERT_EQ(new_cf_opt.comparator, ReverseBytewiseComparator());
+
+  // MergeOperator from object registry
+  std::unique_ptr<BytesXOROperator> bxo(new BytesXOROperator());
+  std::string kMoName = bxo->Name();
+  static Registrar<std::shared_ptr<MergeOperator>> test_reg_b(
+      kMoName, [](const std::string& /*name*/,
+                  std::unique_ptr<std::shared_ptr<MergeOperator>>*
+                      merge_operator_guard) {
+        merge_operator_guard->reset(
+            new std::shared_ptr<MergeOperator>(new BytesXOROperator()));
+        return merge_operator_guard->get();
+      });
+
+  ASSERT_OK(GetColumnFamilyOptionsFromString(
+      base_cf_opt, "merge_operator=" + kMoName + ";", &new_cf_opt));
+  ASSERT_EQ(kMoName, std::string(new_cf_opt.merge_operator->Name()));
 
   // Wrong key/value pair
   ASSERT_NOK(GetColumnFamilyOptionsFromString(base_cf_opt,
@@ -334,7 +419,7 @@ TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
   ASSERT_EQ(new_cf_opt.arena_block_size, 21 * tera);
 
   // Nested block based table options
-  // Emtpy
+  // Empty
   ASSERT_OK(GetColumnFamilyOptionsFromString(base_cf_opt,
             "write_buffer_size=10;max_write_buffer_number=16;"
             "block_based_table_factory={};arena_block_size=1024",
@@ -402,7 +487,7 @@ TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
   ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(base_cf_opt, new_cf_opt));
 
   // Nested plain table options
-  // Emtpy
+  // Empty
   ASSERT_OK(GetColumnFamilyOptionsFromString(base_cf_opt,
             "write_buffer_size=10;max_write_buffer_number=16;"
             "plain_table_factory={};arena_block_size=1024",
@@ -496,6 +581,101 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_EQ(table_opt.cache_index_and_filter_blocks,
             new_opt.cache_index_and_filter_blocks);
   ASSERT_EQ(table_opt.filter_policy, new_opt.filter_policy);
+
+  // Check block cache options are overwritten when specified
+  // in new format as a struct.
+  ASSERT_OK(GetBlockBasedTableOptionsFromString(table_opt,
+             "block_cache={capacity=1M;num_shard_bits=4;"
+             "strict_capacity_limit=true;high_pri_pool_ratio=0.5;};"
+             "block_cache_compressed={capacity=1M;num_shard_bits=4;"
+             "strict_capacity_limit=true;high_pri_pool_ratio=0.5;}",
+             &new_opt));
+  ASSERT_TRUE(new_opt.block_cache != nullptr);
+  ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache)->GetNumShardBits(), 4);
+  ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), true);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache)->GetHighPriPoolRatio(), 0.5);
+  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
+  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL*1024UL);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache_compressed)->GetNumShardBits(), 4);
+  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), true);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache_compressed)->GetHighPriPoolRatio(),
+                0.5);
+
+  // Set only block cache capacity. Check other values are
+  // reset to default values.
+  ASSERT_OK(GetBlockBasedTableOptionsFromString(table_opt,
+             "block_cache={capacity=2M};"
+             "block_cache_compressed={capacity=2M}",
+             &new_opt));
+  ASSERT_TRUE(new_opt.block_cache != nullptr);
+  ASSERT_EQ(new_opt.block_cache->GetCapacity(), 2*1024UL*1024UL);
+  // Default values
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache)->GetNumShardBits(),
+                GetDefaultCacheShardBits(new_opt.block_cache->GetCapacity()));
+  ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), false);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache)->GetHighPriPoolRatio(), 0.0);
+  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
+  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 2*1024UL*1024UL);
+  // Default values
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache_compressed)->GetNumShardBits(),
+                GetDefaultCacheShardBits(
+                    new_opt.block_cache_compressed->GetCapacity()));
+  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), false);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache_compressed)->GetHighPriPoolRatio(),
+                0.0);
+
+  // Set couple of block cache options.
+  ASSERT_OK(GetBlockBasedTableOptionsFromString(table_opt,
+             "block_cache={num_shard_bits=5;high_pri_pool_ratio=0.5;};"
+             "block_cache_compressed={num_shard_bits=5;"
+             "high_pri_pool_ratio=0.5;}",
+             &new_opt));
+  ASSERT_EQ(new_opt.block_cache->GetCapacity(), 0);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache)->GetNumShardBits(), 5);
+  ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), false);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache)->GetHighPriPoolRatio(), 0.5);
+  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
+  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 0);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache_compressed)->GetNumShardBits(), 5);
+  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), false);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache_compressed)->GetHighPriPoolRatio(),
+                0.5);
+
+  // Set couple of block cache options.
+  ASSERT_OK(GetBlockBasedTableOptionsFromString(table_opt,
+             "block_cache={capacity=1M;num_shard_bits=4;"
+             "strict_capacity_limit=true;};"
+             "block_cache_compressed={capacity=1M;num_shard_bits=4;"
+             "strict_capacity_limit=true;}",
+             &new_opt));
+  ASSERT_TRUE(new_opt.block_cache != nullptr);
+  ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache)->GetNumShardBits(), 4);
+  ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), true);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache)->GetHighPriPoolRatio(), 0.0);
+  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
+  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL*1024UL);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
+                new_opt.block_cache_compressed)->GetNumShardBits(), 4);
+  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), true);
+  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
+                new_opt.block_cache_compressed)->GetHighPriPoolRatio(),
+                0.0);
 }
 #endif  // !ROCKSDB_LITE
 
@@ -565,8 +745,8 @@ TEST_F(OptionsTest, GetMemTableRepFactoryFromString) {
                                              &new_mem_factory));
 
   ASSERT_NOK(GetMemTableRepFactoryFromString("cuckoo", &new_mem_factory));
-  ASSERT_OK(GetMemTableRepFactoryFromString("cuckoo:1024", &new_mem_factory));
-  ASSERT_EQ(std::string(new_mem_factory->Name()), "HashCuckooRepFactory");
+  // CuckooHash memtable is already removed.
+  ASSERT_NOK(GetMemTableRepFactoryFromString("cuckoo:1024", &new_mem_factory));
 
   ASSERT_NOK(GetMemTableRepFactoryFromString("bad_factory", &new_mem_factory));
 }
@@ -581,19 +761,44 @@ TEST_F(OptionsTest, GetOptionsFromStringTest) {
   block_based_table_options.cache_index_and_filter_blocks = true;
   base_options.table_factory.reset(
       NewBlockBasedTableFactory(block_based_table_options));
+
+  // Register an Env with object registry.
+  const static char* kCustomEnvName = "CustomEnv";
+  class CustomEnv : public EnvWrapper {
+   public:
+    explicit CustomEnv(Env* _target) : EnvWrapper(_target) {}
+  };
+
+  static Registrar<Env> test_reg_env(
+      kCustomEnvName,
+      [](const std::string& /*name*/, std::unique_ptr<Env>* /*env_guard*/) {
+        static CustomEnv env(Env::Default());
+        return &env;
+      });
+
   ASSERT_OK(GetOptionsFromString(
       base_options,
       "write_buffer_size=10;max_write_buffer_number=16;"
       "block_based_table_factory={block_cache=1M;block_size=4;};"
       "compression_opts=4:5:6;create_if_missing=true;max_open_files=1;"
-      "rate_limiter_bytes_per_sec=1024",
+      "bottommost_compression_opts=5:6:7;create_if_missing=true;max_open_files="
+      "1;"
+      "rate_limiter_bytes_per_sec=1024;env=CustomEnv",
       &new_options));
 
   ASSERT_EQ(new_options.compression_opts.window_bits, 4);
   ASSERT_EQ(new_options.compression_opts.level, 5);
   ASSERT_EQ(new_options.compression_opts.strategy, 6);
   ASSERT_EQ(new_options.compression_opts.max_dict_bytes, 0);
+  ASSERT_EQ(new_options.compression_opts.zstd_max_train_bytes, 0);
+  ASSERT_EQ(new_options.compression_opts.enabled, false);
   ASSERT_EQ(new_options.bottommost_compression, kDisableCompressionOption);
+  ASSERT_EQ(new_options.bottommost_compression_opts.window_bits, 5);
+  ASSERT_EQ(new_options.bottommost_compression_opts.level, 6);
+  ASSERT_EQ(new_options.bottommost_compression_opts.strategy, 7);
+  ASSERT_EQ(new_options.bottommost_compression_opts.max_dict_bytes, 0);
+  ASSERT_EQ(new_options.bottommost_compression_opts.zstd_max_train_bytes, 0);
+  ASSERT_EQ(new_options.bottommost_compression_opts.enabled, false);
   ASSERT_EQ(new_options.write_buffer_size, 10U);
   ASSERT_EQ(new_options.max_write_buffer_number, 16);
   BlockBasedTableOptions new_block_based_table_options =
@@ -607,6 +812,8 @@ TEST_F(OptionsTest, GetOptionsFromStringTest) {
   ASSERT_EQ(new_options.create_if_missing, true);
   ASSERT_EQ(new_options.max_open_files, 1);
   ASSERT_TRUE(new_options.rate_limiter.get() != nullptr);
+  std::unique_ptr<Env> env_guard;
+  ASSERT_EQ(NewCustomObject<Env>(kCustomEnvName, &env_guard), new_options.env);
 }
 
 TEST_F(OptionsTest, DBOptionsSerialization) {
@@ -625,6 +832,25 @@ TEST_F(OptionsTest, DBOptionsSerialization) {
   ASSERT_OK(GetDBOptionsFromString(DBOptions(), base_options_file_content,
                                    &new_options));
   ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(base_options, new_options));
+}
+
+TEST_F(OptionsTest, OptionsComposeDecompose) {
+  // build an Options from DBOptions + CFOptions, then decompose it to verify
+  // we get same constituent options.
+  DBOptions base_db_opts;
+  ColumnFamilyOptions base_cf_opts;
+
+  Random rnd(301);
+  test::RandomInitDBOptions(&base_db_opts, &rnd);
+  test::RandomInitCFOptions(&base_cf_opts, &rnd);
+
+  Options base_opts(base_db_opts, base_cf_opts);
+  DBOptions new_db_opts(base_opts);
+  ColumnFamilyOptions new_cf_opts(base_opts);
+
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(base_db_opts, new_db_opts));
+  ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(base_cf_opts, new_cf_opts));
+  delete new_cf_opts.compaction_filter;
 }
 
 TEST_F(OptionsTest, ColumnFamilyOptionsSerialization) {
@@ -856,11 +1082,11 @@ TEST_F(OptionsTest, ConvertOptionsTest) {
   ASSERT_EQ(converted_opt.max_open_files, leveldb_opt.max_open_files);
   ASSERT_EQ(converted_opt.compression, leveldb_opt.compression);
 
-  std::shared_ptr<BlockBasedTableFactory> table_factory =
-      std::dynamic_pointer_cast<BlockBasedTableFactory>(
-          converted_opt.table_factory);
+  std::shared_ptr<TableFactory> tb_guard = converted_opt.table_factory;
+  BlockBasedTableFactory* table_factory =
+      dynamic_cast<BlockBasedTableFactory*>(converted_opt.table_factory.get());
 
-  ASSERT_TRUE(table_factory.get() != nullptr);
+  ASSERT_TRUE(table_factory != nullptr);
 
   const BlockBasedTableOptions table_opt = table_factory->table_options();
 
@@ -1066,6 +1292,82 @@ TEST_F(OptionsParserTest, DuplicateCFOptions) {
   ASSERT_NOK(parser.Parse(kTestFileName, env_.get()));
 }
 
+TEST_F(OptionsParserTest, IgnoreUnknownOptions) {
+  for (int case_id = 0; case_id < 5; case_id++) {
+    DBOptions db_opt;
+    db_opt.max_open_files = 12345;
+    db_opt.max_background_flushes = 301;
+    db_opt.max_total_wal_size = 1024;
+    ColumnFamilyOptions cf_opt;
+
+    std::string version_string;
+    bool should_ignore = true;
+    if (case_id == 0) {
+      // same version
+      should_ignore = false;
+      version_string =
+          ToString(ROCKSDB_MAJOR) + "." + ToString(ROCKSDB_MINOR) + ".0";
+    } else if (case_id == 1) {
+      // higher minor version
+      should_ignore = true;
+      version_string =
+          ToString(ROCKSDB_MAJOR) + "." + ToString(ROCKSDB_MINOR + 1) + ".0";
+    } else if (case_id == 2) {
+      // higher major version.
+      should_ignore = true;
+      version_string = ToString(ROCKSDB_MAJOR + 1) + ".0.0";
+    } else if (case_id == 3) {
+      // lower minor version
+#if ROCKSDB_MINOR == 0
+      continue;
+#else
+      version_string =
+          ToString(ROCKSDB_MAJOR) + "." + ToString(ROCKSDB_MINOR - 1) + ".0";
+      should_ignore = false;
+#endif
+    } else {
+      // lower major version
+      should_ignore = false;
+      version_string =
+          ToString(ROCKSDB_MAJOR - 1) + "." + ToString(ROCKSDB_MINOR) + ".0";
+    }
+
+    std::string options_file_content =
+        "# This is a testing option string.\n"
+        "# Currently we only support \"#\" styled comment.\n"
+        "\n"
+        "[Version]\n"
+        "  rocksdb_version=" +
+        version_string +
+        "\n"
+        "  options_file_version=1\n"
+        "[DBOptions]\n"
+        "  max_open_files=12345\n"
+        "  max_background_flushes=301\n"
+        "  max_total_wal_size=1024  # keep_log_file_num=1000\n"
+        "  unknown_db_option1=321\n"
+        "  unknown_db_option2=false\n"
+        "[CFOptions \"default\"]\n"
+        "  unknown_cf_option1=hello\n"
+        "[CFOptions \"something_else\"]\n"
+        "  unknown_cf_option2=world\n"
+        "  # if a section is blank, we will use the default\n";
+
+    const std::string kTestFileName = "test-rocksdb-options.ini";
+    env_->DeleteFile(kTestFileName);
+    env_->WriteToNewFile(kTestFileName, options_file_content);
+    RocksDBOptionsParser parser;
+    ASSERT_NOK(parser.Parse(kTestFileName, env_.get()));
+    if (should_ignore) {
+      ASSERT_OK(parser.Parse(kTestFileName, env_.get(),
+                             true /* ignore_unknown_options */));
+    } else {
+      ASSERT_NOK(parser.Parse(kTestFileName, env_.get(),
+                              true /* ignore_unknown_options */));
+    }
+  }
+}
+
 TEST_F(OptionsParserTest, ParseVersion) {
   DBOptions db_opt;
   db_opt.max_open_files = 12345;
@@ -1211,6 +1513,11 @@ TEST_F(OptionsParserTest, DumpAndParse) {
   Random rnd(302);
   test::RandomInitDBOptions(&base_db_opt, &rnd);
   base_db_opt.db_log_dir += "/#odd #but #could #happen #path #/\\\\#OMG";
+
+  BlockBasedTableOptions special_bbto;
+  special_bbto.cache_index_and_filter_blocks = true;
+  special_bbto.block_size = 999999;
+
   for (int c = 0; c < num_cf; ++c) {
     ColumnFamilyOptions cf_opt;
     Random cf_rnd(0xFB + c);
@@ -1220,6 +1527,8 @@ TEST_F(OptionsParserTest, DumpAndParse) {
     }
     if (c < 3) {
       cf_opt.table_factory.reset(test::RandomTableFactory(&rnd, c));
+    } else if (c == 4) {
+      cf_opt.table_factory.reset(NewBlockBasedTableFactory(special_bbto));
     }
     base_cf_opts.emplace_back(cf_opt);
   }
@@ -1230,6 +1539,15 @@ TEST_F(OptionsParserTest, DumpAndParse) {
 
   RocksDBOptionsParser parser;
   ASSERT_OK(parser.Parse(kOptionsFileName, env_.get()));
+
+  // Make sure block-based table factory options was deserialized correctly
+  std::shared_ptr<TableFactory> ttf = (*parser.cf_opts())[4].table_factory;
+  ASSERT_EQ(BlockBasedTableFactory::kName, std::string(ttf->Name()));
+  const BlockBasedTableOptions& parsed_bbto =
+      static_cast<BlockBasedTableFactory*>(ttf.get())->table_options();
+  ASSERT_EQ(special_bbto.block_size, parsed_bbto.block_size);
+  ASSERT_EQ(special_bbto.cache_index_and_filter_blocks,
+            parsed_bbto.cache_index_and_filter_blocks);
 
   ASSERT_OK(RocksDBOptionsParser::VerifyRocksDBOptionsFromFile(
       base_db_opt, cf_names, base_cf_opts, kOptionsFileName, env_.get()));
@@ -1268,6 +1586,7 @@ TEST_F(OptionsParserTest, DifferentDefault) {
   const std::string kOptionsFileName = "test-persisted-options.ini";
 
   ColumnFamilyOptions cf_level_opts;
+  ASSERT_EQ(CompactionPri::kMinOverlappingRatio, cf_level_opts.compaction_pri);
   cf_level_opts.OptimizeLevelStyleCompaction();
 
   ColumnFamilyOptions cf_univ_opts;
@@ -1285,7 +1604,6 @@ TEST_F(OptionsParserTest, DifferentDefault) {
     old_default_opts.OldDefaults();
     ASSERT_EQ(10 * 1048576, old_default_opts.max_bytes_for_level_base);
     ASSERT_EQ(5000, old_default_opts.max_open_files);
-    ASSERT_EQ(-1, old_default_opts.base_background_compactions);
     ASSERT_EQ(2 * 1024U * 1024U, old_default_opts.delayed_write_rate);
     ASSERT_EQ(WALRecoveryMode::kTolerateCorruptedTailRecords,
               old_default_opts.wal_recovery_mode);
@@ -1338,6 +1656,14 @@ TEST_F(OptionsParserTest, DifferentDefault) {
     Options old_default_opts;
     old_default_opts.OldDefaults(5, 2);
     ASSERT_EQ(16 * 1024U * 1024U, old_default_opts.delayed_write_rate);
+    ASSERT_TRUE(old_default_opts.compaction_pri ==
+                CompactionPri::kByCompensatedSize);
+  }
+  {
+    Options old_default_opts;
+    old_default_opts.OldDefaults(5, 18);
+    ASSERT_TRUE(old_default_opts.compaction_pri ==
+                CompactionPri::kByCompensatedSize);
   }
 
   Options small_opts;
@@ -1394,13 +1720,15 @@ TEST_F(OptionsSanityCheckTest, SanityCheck) {
 
     // use same prefix extractor but with different parameter
     opts.prefix_extractor.reset(NewCappedPrefixTransform(15));
-    // expect pass only in kSanityLevelNone
-    ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
+    // expect pass only in kSanityLevelLooselyCompatible
+    ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelExactMatch));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
     ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelNone));
 
     // repeat the test with FixedPrefixTransform
     opts.prefix_extractor.reset(NewFixedPrefixTransform(10));
-    ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
+    ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelExactMatch));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
     ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelNone));
 
     // persist the change of prefix_extractor
@@ -1409,8 +1737,9 @@ TEST_F(OptionsSanityCheckTest, SanityCheck) {
 
     // use same prefix extractor but with different parameter
     opts.prefix_extractor.reset(NewFixedPrefixTransform(15));
-    // expect pass only in kSanityLevelNone
-    ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
+    // expect pass only in kSanityLevelLooselyCompatible
+    ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelExactMatch));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
     ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelNone));
 
     // Change prefix extractor from non-nullptr to nullptr
@@ -1440,6 +1769,15 @@ TEST_F(OptionsSanityCheckTest, SanityCheck) {
 
   // merge_operator
   {
+    // Test when going from nullptr -> merge operator
+    opts.merge_operator.reset(test::RandomMergeOperator(&rnd));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelNone));
+
+    // persist the change
+    ASSERT_OK(PersistCFOptions(opts));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelExactMatch));
+
     for (int test = 0; test < 5; ++test) {
       // change the merge operator
       opts.merge_operator.reset(test::RandomMergeOperator(&rnd));
@@ -1450,6 +1788,15 @@ TEST_F(OptionsSanityCheckTest, SanityCheck) {
       ASSERT_OK(PersistCFOptions(opts));
       ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelExactMatch));
     }
+
+    // Test when going from merge operator -> nullptr
+    opts.merge_operator = nullptr;
+    ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelNone));
+
+    // persist the change
+    ASSERT_OK(PersistCFOptions(opts));
+    ASSERT_OK(SanityCheckCFOptions(opts, kSanityLevelExactMatch));
   }
 
   // compaction_filter
@@ -1517,6 +1864,18 @@ bool IsEscapedString(const std::string& str) {
   return true;
 }
 }  // namespace
+
+TEST_F(OptionsParserTest, IntegerParsing) {
+  ASSERT_EQ(ParseUint64("18446744073709551615"), 18446744073709551615U);
+  ASSERT_EQ(ParseUint32("4294967295"), 4294967295U);
+  ASSERT_EQ(ParseSizeT("18446744073709551615"), 18446744073709551615U);
+  ASSERT_EQ(ParseInt64("9223372036854775807"), 9223372036854775807U);
+  ASSERT_EQ(ParseInt64("-9223372036854775808"), port::kMinInt64);
+  ASSERT_EQ(ParseInt32("2147483647"), 2147483647U);
+  ASSERT_EQ(ParseInt32("-2147483648"), port::kMinInt32);
+  ASSERT_EQ(ParseInt("-32767"), -32767);
+  ASSERT_EQ(ParseDouble("-1.234567"), -1.234567);
+}
 
 TEST_F(OptionsParserTest, EscapeOptionString) {
   ASSERT_EQ(UnescapeOptionString(

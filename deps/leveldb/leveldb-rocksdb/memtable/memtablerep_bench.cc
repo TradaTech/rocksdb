@@ -1,13 +1,15 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
+#endif
 
 #ifndef GFLAGS
 #include <cstdio>
@@ -16,8 +18,6 @@ int main() {
   return 1;
 }
 #else
-
-#include <gflags/gflags.h>
 
 #include <atomic>
 #include <iostream>
@@ -36,13 +36,14 @@ int main() {
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "util/arena.h"
+#include "util/gflags_compat.h"
 #include "util/mutexlock.h"
 #include "util/stop_watch.h"
 #include "util/testutil.h"
 
-using GFLAGS::ParseCommandLineFlags;
-using GFLAGS::RegisterFlagValidator;
-using GFLAGS::SetUsageMessage;
+using GFLAGS_NAMESPACE::ParseCommandLineFlags;
+using GFLAGS_NAMESPACE::RegisterFlagValidator;
+using GFLAGS_NAMESPACE::SetUsageMessage;
 
 DEFINE_string(benchmarks, "fillrandom",
               "Comma-separated list of benchmarks to run. Options:\n"
@@ -94,17 +95,8 @@ DEFINE_int32(
     threshold_use_skiplist, 256,
     "threshold_use_skiplist parameter to pass into NewHashLinkListRepFactory");
 
-DEFINE_int64(
-    write_buffer_size, 256,
-    "write_buffer_size parameter to pass into NewHashCuckooRepFactory");
-
-DEFINE_int64(
-    average_data_size, 64,
-    "average_data_size parameter to pass into NewHashCuckooRepFactory");
-
-DEFINE_int64(
-    hash_function_count, 4,
-    "hash_function_count parameter to pass into NewHashCuckooRepFactory");
+DEFINE_int64(write_buffer_size, 256,
+             "write_buffer_size parameter to pass into WriteBufferManager");
 
 DEFINE_int32(
     num_threads, 1,
@@ -478,8 +470,8 @@ class FillBenchmark : public Benchmark {
     num_write_ops_per_thread_ = FLAGS_num_operations;
   }
 
-  void RunThreads(std::vector<port::Thread>* threads, uint64_t* bytes_written,
-                  uint64_t* bytes_read, bool write,
+  void RunThreads(std::vector<port::Thread>* /*threads*/, uint64_t* bytes_written,
+                  uint64_t* bytes_read, bool /*write*/,
                   uint64_t* read_hits) override {
     FillBenchmarkThread(table_, key_gen_, bytes_written, bytes_read, sequence_,
                         num_write_ops_per_thread_, read_hits)();
@@ -495,7 +487,7 @@ class ReadBenchmark : public Benchmark {
   }
 
   void RunThreads(std::vector<port::Thread>* threads, uint64_t* bytes_written,
-                  uint64_t* bytes_read, bool write,
+                  uint64_t* bytes_read, bool /*write*/,
                   uint64_t* read_hits) override {
     for (int i = 0; i < FLAGS_num_threads; ++i) {
       threads->emplace_back(
@@ -519,7 +511,7 @@ class SeqReadBenchmark : public Benchmark {
   }
 
   void RunThreads(std::vector<port::Thread>* threads, uint64_t* bytes_written,
-                  uint64_t* bytes_read, bool write,
+                  uint64_t* bytes_read, bool /*write*/,
                   uint64_t* read_hits) override {
     for (int i = 0; i < FLAGS_num_threads; ++i) {
       threads->emplace_back(SeqReadBenchmarkThread(
@@ -546,7 +538,7 @@ class ReadWriteBenchmark : public Benchmark {
   }
 
   void RunThreads(std::vector<port::Thread>* threads, uint64_t* bytes_written,
-                  uint64_t* bytes_read, bool write,
+                  uint64_t* bytes_read, bool /*write*/,
                   uint64_t* read_hits) override {
     std::atomic_int threads_done;
     threads_done.store(0);
@@ -606,12 +598,6 @@ int main(int argc, char** argv) {
         FLAGS_if_log_bucket_dist_when_flash, FLAGS_threshold_use_skiplist));
     options.prefix_extractor.reset(
         rocksdb::NewFixedPrefixTransform(FLAGS_prefix_length));
-  } else if (FLAGS_memtablerep == "cuckoo") {
-    factory.reset(rocksdb::NewHashCuckooRepFactory(
-        FLAGS_write_buffer_size, FLAGS_average_data_size,
-        static_cast<uint32_t>(FLAGS_hash_function_count)));
-    options.prefix_extractor.reset(
-        rocksdb::NewFixedPrefixTransform(FLAGS_prefix_length));
 #endif  // ROCKSDB_LITE
   } else {
     fprintf(stdout, "Unknown memtablerep: %s\n", FLAGS_memtablerep.c_str());
@@ -623,11 +609,10 @@ int main(int argc, char** argv) {
   rocksdb::MemTable::KeyComparator key_comp(internal_key_comp);
   rocksdb::Arena arena;
   rocksdb::WriteBufferManager wb(FLAGS_write_buffer_size);
-  rocksdb::MemTableAllocator memtable_allocator(&arena, &wb);
   uint64_t sequence;
   auto createMemtableRep = [&] {
     sequence = 0;
-    return factory->CreateMemTableRep(key_comp, &memtable_allocator,
+    return factory->CreateMemTableRep(key_comp, &arena,
                                       options.prefix_extractor.get(),
                                       options.info_log.get());
   };

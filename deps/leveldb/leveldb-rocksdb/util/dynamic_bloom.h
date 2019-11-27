@@ -1,7 +1,7 @@
 // Copyright (c) 2011-present, Facebook, Inc. All rights reserved.
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree. An additional grant
-// of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 
 #pragma once
 
@@ -10,6 +10,7 @@
 #include "rocksdb/slice.h"
 
 #include "port/port.h"
+#include "util/hash.h"
 
 #include <atomic>
 #include <memory>
@@ -28,19 +29,17 @@ class DynamicBloom {
   // locality:  If positive, optimize for cache line locality, 0 otherwise.
   // hash_func:  customized hash function
   // huge_page_tlb_size:  if >0, try to allocate bloom bytes from huge page TLB
-  //                      withi this page size. Need to reserve huge pages for
+  //                      within this page size. Need to reserve huge pages for
   //                      it to be allocated, like:
   //                         sysctl -w vm.nr_hugepages=20
   //                     See linux doc Documentation/vm/hugetlbpage.txt
   explicit DynamicBloom(Allocator* allocator,
                         uint32_t total_bits, uint32_t locality = 0,
                         uint32_t num_probes = 6,
-                        uint32_t (*hash_func)(const Slice& key) = nullptr,
                         size_t huge_page_tlb_size = 0,
                         Logger* logger = nullptr);
 
-  explicit DynamicBloom(uint32_t num_probes = 6,
-                        uint32_t (*hash_func)(const Slice& key) = nullptr);
+  explicit DynamicBloom(uint32_t num_probes = 6);
 
   void SetTotalBits(Allocator* allocator, uint32_t total_bits,
                     uint32_t locality, size_t huge_page_tlb_size,
@@ -86,7 +85,6 @@ class DynamicBloom {
   uint32_t kNumBlocks;
   const uint32_t kNumProbes;
 
-  uint32_t (*hash_func_)(const Slice& key);
   std::atomic<uint8_t>* data_;
 
   // or_func(ptr, mask) should effect *ptr |= mask with the appropriate
@@ -95,10 +93,10 @@ class DynamicBloom {
   void AddHash(uint32_t hash, const OrFunc& or_func);
 };
 
-inline void DynamicBloom::Add(const Slice& key) { AddHash(hash_func_(key)); }
+inline void DynamicBloom::Add(const Slice& key) { AddHash(BloomHash(key)); }
 
 inline void DynamicBloom::AddConcurrently(const Slice& key) {
-  AddHashConcurrently(hash_func_(key));
+  AddHashConcurrently(BloomHash(key));
 }
 
 inline void DynamicBloom::AddHash(uint32_t hash) {
@@ -122,15 +120,23 @@ inline void DynamicBloom::AddHashConcurrently(uint32_t hash) {
 }
 
 inline bool DynamicBloom::MayContain(const Slice& key) const {
-  return (MayContainHash(hash_func_(key)));
+  return (MayContainHash(BloomHash(key)));
 }
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+// local variable is initialized but not referenced
+#pragma warning(disable : 4189) 
+#endif
 inline void DynamicBloom::Prefetch(uint32_t h) {
   if (kNumBlocks != 0) {
     uint32_t b = ((h >> 11 | (h << 21)) % kNumBlocks) * (CACHE_LINE_SIZE * 8);
     PREFETCH(&(data_[b / 8]), 0, 3);
   }
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 inline bool DynamicBloom::MayContainHash(uint32_t h) const {
   assert(IsInitialized());

@@ -1,4 +1,5 @@
 #!/bin/sh
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 #
 # Set environment variables so that we can compile rocksdb using
 # fbcode settings.  It uses the latest g++ compiler and also
@@ -54,6 +55,7 @@ TBB_LIBS="$TBB_BASE/lib/libtbb.a"
 
 # use Intel SSE support for checksum calculations
 export USE_SSE=1
+export PORTABLE=1
 
 BINUTILS="$BINUTILS_BASE/bin"
 AR="$BINUTILS/ar"
@@ -93,7 +95,7 @@ else
 fi
 
 CFLAGS+=" $DEPS_INCLUDE"
-CFLAGS+=" -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DROCKSDB_FALLOCATE_PRESENT -DROCKSDB_MALLOC_USABLE_SIZE"
+CFLAGS+=" -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DROCKSDB_FALLOCATE_PRESENT -DROCKSDB_MALLOC_USABLE_SIZE -DROCKSDB_RANGESYNC_PRESENT -DROCKSDB_SCHED_GETCPU_PRESENT -DROCKSDB_SUPPORT_THREAD_LOCAL -DHAVE_SSE42"
 CFLAGS+=" -DSNAPPY -DGFLAGS=google -DZLIB -DBZIP2 -DLZ4 -DZSTD -DNUMA -DTBB"
 CXXFLAGS+=" $CFLAGS"
 
