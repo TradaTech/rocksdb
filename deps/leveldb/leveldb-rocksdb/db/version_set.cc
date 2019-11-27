@@ -16,14 +16,13 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <algorithm>
+#include <climits>
 #include <map>
 #include <set>
-#include <climits>
+#include <string>
 #include <unordered_map>
 #include <vector>
-#include <string>
 #include "db/compaction.h"
-#include "db/filename.h"
 #include "db/internal_stats.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
@@ -46,6 +45,7 @@
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
+#include "util/filename.h"
 #include "util/logging.h"
 #include "util/perf_context_imp.h"
 #include "util/stop_watch.h"
@@ -1310,6 +1310,14 @@ void VersionStorageInfo::ComputeCompactionScore(
       } else {
         score = static_cast<double>(num_sorted_runs) /
                 mutable_cf_options.level0_file_num_compaction_trigger;
+        if (compaction_style_ == kCompactionStyleLevel && num_levels() > 1) {
+          // Level-based involves L0->L0 compactions that can lead to oversized
+          // L0 files. Take into account size as well to avoid later giant
+          // compactions to the base level.
+          uint64_t base_level_max_bytes = MaxBytesForLevel(base_level());
+          score = std::max(
+              score, static_cast<double>(total_size) / base_level_max_bytes);
+        }
       }
     } else {
       // Compute the ratio of current size to size limit.

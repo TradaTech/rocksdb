@@ -1,6 +1,5 @@
 # These are the sources from which librocksdb.a is built:
 LIB_SOURCES =                                                   \
-  db/auto_roll_logger.cc                                        \
   db/builder.cc                                                 \
   db/c.cc                                                       \
   db/column_family.cc                                           \
@@ -14,6 +13,10 @@ LIB_SOURCES =                                                   \
   db/db_filesnapshot.cc                                         \
   db/dbformat.cc                                                \
   db/db_impl.cc                                                 \
+  db/db_impl_write.cc                                           \
+  db/db_impl_compaction_flush.cc                                                 \
+  db/db_impl_files.cc                                           \
+  db/db_impl_open.cc                                           \
   db/db_impl_debug.cc                                           \
   db/db_impl_readonly.cc                                        \
   db/db_impl_experimental.cc                                    \
@@ -23,7 +26,6 @@ LIB_SOURCES =                                                   \
   db/experimental.cc                                            \
   db/event_helpers.cc                                           \
   db/file_indexer.cc                                            \
-  db/filename.cc                                                \
   db/flush_job.cc                                               \
   db/flush_scheduler.cc                                         \
   db/forward_iterator.cc                                        \
@@ -88,6 +90,7 @@ LIB_SOURCES =                                                   \
   table/two_level_iterator.cc                                   \
   tools/dump/db_dump_tool.cc                                    \
   util/arena.cc                                                 \
+  util/auto_roll_logger.cc                                      \
   util/bloom.cc                                                 \
   util/build_version.cc                                         \
   util/cf_options.cc                                            \
@@ -107,6 +110,7 @@ LIB_SOURCES =                                                   \
   util/event_logger.cc                                          \
   util/file_util.cc                                             \
   util/file_reader_writer.cc                                    \
+  util/filename.cc                                              \
   util/filter_policy.cc                                         \
   util/hash.cc                                                  \
   util/histogram.cc                                             \
@@ -153,6 +157,7 @@ LIB_SOURCES =                                                   \
   utilities/document/json_document_builder.cc                   \
   utilities/document/json_document.cc                           \
   utilities/env_mirror.cc                                       \
+  utilities/env_timed.cc                                        \
   utilities/geodb/geodb_impl.cc                                 \
   utilities/leveldb_options/leveldb_options.cc                  \
   utilities/lua/rocks_lua_compaction_filter.cc                  \
@@ -211,7 +216,6 @@ TEST_LIB_SOURCES = \
 
 MAIN_SOURCES =                                                    \
   third-party/gtest-1.7.0/fused-src/gtest/gtest-all.cc                  \
-  db/auto_roll_logger_test.cc                                           \
   db/column_family_test.cc                                              \
   db/compaction_job_test.cc                                             \
   db/compaction_job_stats_test.cc                                       \
@@ -283,6 +287,7 @@ MAIN_SOURCES =                                                    \
   tools/reduce_levels_test.cc                                           \
   tools/sst_dump_test.cc                                                \
   util/arena_test.cc                                                    \
+  util/auto_roll_logger_test.cc                                         \
   util/autovector_test.cc                                               \
   util/bloom_test.cc                                                    \
   util/cache_bench.cc                                                   \

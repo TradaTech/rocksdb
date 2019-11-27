@@ -10,11 +10,11 @@
 #include <list>
 #include <string>
 
-#include "db/filename.h"
 #include "port/port.h"
 #include "port/util_logger.h"
-#include "util/sync_point.h"
+#include "util/filename.h"
 #include "util/mutexlock.h"
+#include "util/sync_point.h"
 
 namespace rocksdb {
 
@@ -90,6 +90,8 @@ class AutoRollLogger : public Logger {
   std::string TEST_log_fname() const {
     return log_fname_;
   }
+
+  uint64_t TEST_ctime() const { return ctime_; }
 
  private:
   bool LogExpired();
