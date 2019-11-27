@@ -352,6 +352,8 @@
       , 'leveldb-<(ldbversion)/util/transaction_test_util.cc'
       , 'leveldb-<(ldbversion)/util/xxhash.cc'
 
+      , 'leveldb-<(ldbversion)/gtest/gtest-all.cc'
+
       , 'leveldb-<(ldbversion)/utilities/backupable/backupable_db.cc'
       , 'leveldb-<(ldbversion)/utilities/blob_db/blob_compaction_filter.cc'
       , 'leveldb-<(ldbversion)/utilities/blob_db/blob_db.cc'
