@@ -1,5 +1,6 @@
 var xtend = require('xtend')
 var supports = require('level-supports')
+var Buffer = require('buffer').Buffer
 var AbstractIterator = require('./abstract-iterator')
 var AbstractChainedBatch = require('./abstract-chained-batch')
 var hasOwnProperty = Object.prototype.hasOwnProperty
@@ -70,10 +71,6 @@ AbstractLevelDOWN.prototype._close = function (callback) {
 AbstractLevelDOWN.prototype.get = function (key, options, callback) {
   if (typeof options === 'function') callback = options
 
-  if (typeof callback !== 'undefined') {
-    throw new Error('get() requires a callback argument')
-  }
-
   var err = this._checkKey(key)
   if (err) return process.nextTick(callback, err)
 
@@ -87,15 +84,11 @@ AbstractLevelDOWN.prototype.get = function (key, options, callback) {
 }
 
 AbstractLevelDOWN.prototype._get = function (key, options, callback) {
-  process.nextTick(function () { callback(new Error('NotFound')) })
+  return process.nextTick(function () { callback(new Error('NotFound')) })
 }
 
 AbstractLevelDOWN.prototype.put = function (key, value, options, callback) {
   if (typeof options === 'function') callback = options
-
-  if (typeof callback !== 'undefined') {
-    throw new Error('put() requires a callback argument')
-  }
 
   var err = this._checkKey(key) || this._checkValue(value)
   if (err) return process.nextTick(callback, err)
@@ -139,10 +132,6 @@ AbstractLevelDOWN.prototype.batch = function (array, options, callback) {
   if (typeof options === 'function') callback = options
 
   if (typeof array === 'function') callback = array
-
-  if (typeof callback !== 'undefined') {
-    throw new Error('batch(array) requires a callback argument')
-  }
 
   if (!Array.isArray(array)) {
     return process.nextTick(callback, new Error('batch(array) requires an array argument'))
